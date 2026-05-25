@@ -12,17 +12,16 @@ from backend.helper.agent.sub_agent.scanner import WebScannerAgent
 from backend.helper.auth import basic_auth_header, parse_header_line
 from backend.helper.settings import ARTIFACT_DIR, REPORT_DIR, RuntimeSettings, load_runtime_settings
 from backend.helper.utils import normalize_url, write_json
+from backend.helper.vuln_types import category_label
 
 
 try:
     from rich import box
     from rich.console import Console
-    from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
     from rich.table import Table
 except ImportError:
     box = None
     Console = None
-    Progress = None
 
 
 ASCII_BANNER = r"""
@@ -107,6 +106,9 @@ def print_plain_report(report: dict[str, Any], json_path: Path, markdown_path: P
     print(f"确认漏洞：{summary.get('confirmed', 0)}")
     print(f"疑似漏洞：{summary.get('suspected', 0)}")
     print(f"候选 Payload：允许 {summary.get('llm_payload_allowed', 0)}，过滤 {summary.get('llm_payload_blocked', 0)}")
+    if summary.get("finding_types"):
+        type_text = "；".join(f"{item.get('label')} {item.get('count')} 项" for item in summary["finding_types"])
+        print(f"漏洞类型：{type_text}")
     print("")
     print("发现项：")
     if not report["findings"]:
@@ -115,6 +117,7 @@ def print_plain_report(report: dict[str, Any], json_path: Path, markdown_path: P
         payloads = ", ".join(finding.get("payloads", [])) or "N/A"
         print(f"[{finding['severity']}] {finding['title']}")
         print(f"  状态：{finding.get('status', 'N/A')}")
+        print(f"  漏洞类型：{finding.get('category_label') or category_label(finding.get('category'))}")
         print(f"  置信度：{finding['confidence']}")
         print(f"  证据：{finding.get('evidence', 'N/A')}")
         print(f"  已执行 Payload：{payloads}")
@@ -142,6 +145,9 @@ def print_rich_report(
     summary_table.add_row("发现数量", str(summary["total_findings"]))
     summary_table.add_row("确认漏洞", str(summary.get("confirmed", 0)))
     summary_table.add_row("疑似漏洞", str(summary.get("suspected", 0)))
+    if summary.get("finding_types"):
+        type_text = "；".join(f"{item.get('label')} {item.get('count')} 项" for item in summary["finding_types"])
+        summary_table.add_row("漏洞类型", type_text)
     summary_table.add_row(
         "候选 Payload",
         f"允许 {summary.get('llm_payload_allowed', 0)} / 过滤 {summary.get('llm_payload_blocked', 0)}",
@@ -151,6 +157,7 @@ def print_rich_report(
     findings_table = Table(title="发现项", show_header=True, header_style="bold magenta", box=box.ASCII)
     findings_table.add_column("严重性", no_wrap=True)
     findings_table.add_column("状态", no_wrap=True)
+    findings_table.add_column("漏洞类型", overflow="fold")
     findings_table.add_column("标题", overflow="fold")
     findings_table.add_column("置信度", no_wrap=True)
     findings_table.add_column("已执行 Payload", overflow="fold")
@@ -160,12 +167,13 @@ def print_rich_report(
             findings_table.add_row(
                 finding["severity"],
                 finding.get("status", "N/A"),
+                finding.get("category_label") or category_label(finding.get("category")),
                 finding["title"],
                 finding["confidence"],
                 ", ".join(finding.get("payloads", [])) or "N/A",
             )
     else:
-        findings_table.add_row("Info", "N/A", "未发现明显风险。", "High", "N/A")
+        findings_table.add_row("Info", "N/A", "N/A", "未发现明显风险。", "High", "N/A")
     console.print(findings_table)
 
     output_table = Table(title="输出文件", show_header=True, header_style="bold green", box=box.ASCII)
@@ -265,32 +273,20 @@ def run_rich(args: argparse.Namespace) -> int:
     settings = settings_from_args(args)
     artifacts: list[tuple[str, Path]] = []
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TimeElapsedColumn(),
-        console=console,
-    ) as progress:
-        task = progress.add_task("运行 NOVA 扫描", total=4)
-        progress.update(task, description="TargetProbe Agent 正在探测目标")
-        probe, probe_path = run_probe(target, settings)
-        artifacts.append(("TargetProbe Agent", probe_path))
-        progress.advance(task)
+    console.print("[cyan][1/4][/cyan] TargetProbe Agent 正在探测目标")
+    probe, probe_path = run_probe(target, settings)
+    artifacts.append(("TargetProbe Agent", probe_path))
 
-        progress.update(task, description="Webscanner Agent 正在爬取目标")
-        webscan, webscan_path = run_webscan(target, settings, probe)
-        artifacts.append(("Webscanner Agent", webscan_path))
-        progress.advance(task)
+    console.print("[cyan][2/4][/cyan] Webscanner Agent 正在爬取目标")
+    webscan, webscan_path = run_webscan(target, settings, probe)
+    artifacts.append(("Webscanner Agent", webscan_path))
 
-        progress.update(task, description="Auditor Agent 正在检查风险并生成候选 Payload")
-        audit, audit_path = run_audit(webscan, settings)
-        artifacts.append(("Auditor Agent", audit_path))
-        progress.advance(task)
+    console.print("[cyan][3/4][/cyan] Auditor Agent 正在检查风险、本地验证并生成候选 Payload")
+    audit, audit_path = run_audit(webscan, settings)
+    artifacts.append(("Auditor Agent", audit_path))
 
-        progress.update(task, description="正在写入扫描报告")
-        report, json_path, markdown_path = write_report(target, probe, webscan, audit)
-        progress.advance(task)
+    console.print("[cyan][4/4][/cyan] 正在写入扫描报告")
+    report, json_path, markdown_path = write_report(target, probe, webscan, audit)
 
     print_rich_report(console, report, json_path, markdown_path, artifacts)
     return 0
@@ -300,7 +296,7 @@ def main() -> int:
     configure_stdio()
     args = build_parser().parse_args()
     try:
-        if Console is None or Progress is None:
+        if Console is None:
             return run_plain(args)
         return run_rich(args)
     except Exception as exc:

@@ -11,6 +11,7 @@ from backend.helper.agent.sub_agent.llm_payload import LLMPayloadAdvisor
 from backend.helper.llm.client import LLMClient
 from backend.helper.settings import RuntimeSettings, load_runtime_settings
 from backend.helper.utils import utc_now
+from backend.helper.vuln_types import category_group, category_label
 
 
 STATUS_CONFIRMED = "确认漏洞"
@@ -351,7 +352,7 @@ class AuditorAgent:
                         "疑似布尔型 SQL 注入",
                         "High",
                         "Medium",
-                        "sqli",
+                        "sqli_blind",
                         false_probe["url"],
                         f"布尔条件响应存在明显差异：true 相似度 {true_score:.2f}，false 相似度 {false_score:.2f}。",
                         payloads=[true_payload, false_payload],
@@ -612,6 +613,8 @@ class AuditorAgent:
             "confidence": confidence,
             "status": status,
             "category": category,
+            "category_label": category_label(category),
+            "category_group": category_group(category),
             "url": url,
             "evidence": evidence,
             "payloads": payloads,

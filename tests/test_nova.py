@@ -28,7 +28,7 @@ def settings(**overrides) -> RuntimeSettings:
         "active_request_timeout": 1,
         "max_active_inputs": 5,
         "llm_analysis": True,
-        "llm_on_local_targets": False,
+        "llm_on_local_targets": True,
         "llm_payload_advisor": True,
         "llm_payload_max_per_param": 5,
         "llm_payload_report_only": True,
@@ -51,6 +51,12 @@ def test_normalize_url_and_scope_rules() -> None:
     assert scope.in_scope("http://other.example/about", 1)[1] == "host_not_allowed"
     assert scope.in_scope("http://example.com/admin/users", 1)[1] == "path_excluded"
     assert scope.in_scope("http://example.com/deep", 2)[1] == "max_depth"
+
+
+def test_runtime_settings_allow_local_llm_by_default() -> None:
+    runtime = RuntimeSettings(None, None, "deepseekV4-flash", None)
+
+    assert runtime.llm_on_local_targets is True
 
 
 def test_probe_detects_basic_auth_and_redacts_headers(monkeypatch) -> None:
@@ -589,7 +595,8 @@ def test_llm_payload_safety_filter_allows_read_only_sqli_progression() -> None:
     allowed = [item for item in results if item["allowed"]]
     blocked = [item for item in results if not item["allowed"]]
     assert len(allowed) == 1
-    assert allowed[0]["category"] == "sqli"
+    assert allowed[0]["category"] == "sqli_progression"
+    assert allowed[0]["category_label"] == "SQL 注入推进候选"
     assert "database()" in allowed[0]["payload"]
     assert len(blocked) == 1
     assert "LOAD_FILE" in blocked[0]["filter_reason"]
@@ -632,7 +639,7 @@ def test_llm_payload_advisor_parses_json_and_does_not_change_findings(monkeypatc
 
 def test_payload_advisor_adds_confirmed_sqli_progression_templates(monkeypatch) -> None:
     def fail_if_called(*_args, **_kwargs):
-        raise AssertionError("local targets should skip LLM network calls by default")
+        raise AssertionError("local targets should skip LLM network calls when disabled")
 
     monkeypatch.setattr("backend.helper.llm.client.LLMClient.chat", fail_if_called)
     webscan = {
@@ -671,7 +678,9 @@ def test_payload_advisor_adds_confirmed_sqli_progression_templates(monkeypatch) 
         }
     ]
 
-    result = LLMPayloadAdvisor(settings(llm_baseurl="http://llm.local", llm_apikey="k", llm_provider="deepseek")).generate(
+    result = LLMPayloadAdvisor(
+        settings(llm_baseurl="http://llm.local", llm_apikey="k", llm_provider="deepseek", llm_on_local_targets=False)
+    ).generate(
         webscan,
         findings,
     )
@@ -738,7 +747,7 @@ def test_llm_payload_advisor_calls_progression_prompt_for_confirmed_findings(mon
 
 def test_payload_advisor_adds_contextual_pairs_and_does_not_target_submit(monkeypatch) -> None:
     def fail_if_called(*_args, **_kwargs):
-        raise AssertionError("local targets should skip LLM network calls by default")
+        raise AssertionError("local targets should skip LLM network calls when disabled")
 
     monkeypatch.setattr("backend.helper.llm.client.LLMClient.chat", fail_if_called)
     webscan = {
@@ -767,7 +776,9 @@ def test_payload_advisor_adds_contextual_pairs_and_does_not_target_submit(monkey
         ],
     }
 
-    result = LLMPayloadAdvisor(settings(llm_baseurl="http://llm.local", llm_apikey="k", llm_provider="deepseek")).generate(
+    result = LLMPayloadAdvisor(
+        settings(llm_baseurl="http://llm.local", llm_apikey="k", llm_provider="deepseek", llm_on_local_targets=False)
+    ).generate(
         webscan,
         [],
     )
@@ -870,10 +881,13 @@ def test_report_contains_probe_payloads_status_evidence_and_llm_advice(tmp_path:
 
     assert report["summary"]["risk_level"] == "Low"
     assert report["summary"]["llm_payload_allowed"] == 1
+    assert report["summary"]["finding_types"][0]["label"] == "输入点注入风险待验证"
     assert json_path.exists()
     markdown = markdown_path.read_text(encoding="utf-8-sig")
     assert "# NOVA 扫描报告" in markdown
     assert "## 目标探测结果" in markdown
+    assert "## 漏洞类型汇总" in markdown
+    assert "输入点注入风险待验证" in markdown
     assert "状态：待验证" in markdown
     assert "status=200" in markdown
     assert "' OR '1'='1" in markdown

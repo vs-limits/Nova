@@ -95,6 +95,8 @@ NOVA 支持两类候选 payload 来源：
 
 候选 payload 第一版仅写入报告，不自动执行，也不参与漏洞确认。所有候选必须经过本地 Safety Filter。
 
+报告和 JSON 会同时保留机器可读的 `category` 以及中文 `category_label` / `category_group`，例如 `sqli` 会显示为“SQL 注入（错误回显/UNION）”，`sqli_blind` 会显示为“SQL 盲注（布尔型）”。Markdown 报告会先给出“漏洞类型汇总”，再按类型分组展示发现项。
+
 Safety Filter 会阻止危险 payload，例如：
 
 - `DROP`、`DELETE`、`UPDATE`、`INSERT`、`ALTER`、`TRUNCATE`
@@ -145,7 +147,7 @@ false: 1' AND '1'='2' #
 | `NOVA_BASIC_USER` | 空 | HTTP Basic Auth 用户名 |
 | `NOVA_BASIC_PASS` | 空 | HTTP Basic Auth 密码 |
 | `NOVA_LLM_ANALYSIS` | `true` | 是否启用 LLM 对 findings 的中文分析补充 |
-| `NOVA_LLM_ON_LOCAL_TARGETS` | `false` | 是否允许对 localhost、127.0.0.1、内网地址调用 LLM |
+| `NOVA_LLM_ON_LOCAL_TARGETS` | `true` | 是否允许对 localhost、127.0.0.1、内网地址调用 LLM；本地靶场默认可以使用 LLM 做候选 payload 迭代 |
 | `NOVA_LLM_PAYLOAD_ADVISOR` | `true` | 是否启用候选 payload 生成 |
 | `NOVA_LLM_PAYLOAD_MAX_PER_PARAM` | `5` | 每个参数最多保留的候选数量 |
 | `NOVA_LLM_PAYLOAD_REPORT_ONLY` | `true` | 候选 payload 是否仅报告。第一版按仅报告处理 |
@@ -198,6 +200,12 @@ python main.py --url http://127.0.0.1/sqli-labs-master/Less-1/?id=1
 确认 SQLi 后，NOVA 会继续做授权靶场内的轻量后续验证，包括 `ORDER BY` 列数探测和 `UNION SELECT` 回显标记探测，并把实际执行过的 payload 写入确认漏洞。
 
 如果确认结果中拿到了列数和回显位，报告的“候选 Payload”章节还会给出推进型参考，例如读取当前库名、数据库版本、当前用户、当前库表名和字段名的只读 `UNION SELECT` 候选。LLM 可用且目标允许调用时，NOVA 会额外调用 LLM 生成 `llm_progression` 候选；这些候选仍然只写入报告，不会自动执行，也不能替代本地响应证据。
+
+本地靶场现在默认允许 LLM 调用。如果你不希望把本地目标上下文发送给 LLM，可以显式关闭：
+
+```bash
+set NOVA_LLM_ON_LOCAL_TARGETS=false
+```
 
 ## 手动运行单个 Agent
 

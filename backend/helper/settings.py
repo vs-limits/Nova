@@ -62,7 +62,7 @@ class RuntimeSettings:
     active_request_timeout: float = 3.0
     max_active_inputs: int = 5
     llm_analysis: bool = True
-    llm_on_local_targets: bool = False
+    llm_on_local_targets: bool = True
     llm_payload_advisor: bool = True
     llm_payload_max_per_param: int = 5
     llm_payload_report_only: bool = True
@@ -105,7 +105,7 @@ def load_runtime_settings() -> RuntimeSettings:
         active_request_timeout=_env_float("NOVA_ACTIVE_REQUEST_TIMEOUT", 3.0),
         max_active_inputs=_env_int("NOVA_MAX_ACTIVE_INPUTS", 5),
         llm_analysis=_env_bool("NOVA_LLM_ANALYSIS", True),
-        llm_on_local_targets=_env_bool("NOVA_LLM_ON_LOCAL_TARGETS", False),
+        llm_on_local_targets=_env_bool("NOVA_LLM_ON_LOCAL_TARGETS", True),
         llm_payload_advisor=_env_bool("NOVA_LLM_PAYLOAD_ADVISOR", True),
         llm_payload_max_per_param=_env_int("NOVA_LLM_PAYLOAD_MAX_PER_PARAM", 5),
         llm_payload_report_only=_env_bool("NOVA_LLM_PAYLOAD_REPORT_ONLY", True),

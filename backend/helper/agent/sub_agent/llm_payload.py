@@ -10,14 +10,15 @@ from urllib.parse import parse_qs, urlparse
 
 from backend.helper.llm.client import LLMClient
 from backend.helper.settings import RuntimeSettings
+from backend.helper.vuln_types import category_group, category_label
 
 
 ADVISORY_CATEGORIES = {
     "sqli": "sqli",
     "sql injection": "sqli",
     "sql_injection": "sqli",
-    "sql_progression": "sqli",
-    "sqli_progression": "sqli",
+    "sql_progression": "sqli_progression",
+    "sqli_progression": "sqli_progression",
     "confirmed_sqli": "sqli",
     "blind_sqli": "sqli_blind",
     "sqli_blind": "sqli_blind",
@@ -36,6 +37,8 @@ ADVISORY_CATEGORIES = {
 class FilteredPayload:
     input_point: str
     category: str
+    category_label: str
+    category_group: str
     target_param: str
     payload: str
     allowed: bool
@@ -79,6 +82,8 @@ class PayloadSafetyFilter:
             return ADVISORY_CATEGORIES[lowered]
         payload_lower = payload.lower()
         if "union select" in payload_lower or "information_schema" in payload_lower:
+            if lowered in {"sql_progression", "sqli_progression"}:
+                return "sqli_progression"
             return "sqli"
         if any(token in payload_lower for token in ("1=1", "1=2", " or ", " and ")):
             return "sqli_blind" if "1=2" in payload_lower else "sqli"
@@ -138,6 +143,8 @@ class PayloadSafetyFilter:
         result = FilteredPayload(
             input_point=str(candidate.get("input_point") or ""),
             category=category,
+            category_label=category_label(category),
+            category_group=category_group(category),
             target_param=str(candidate.get("target_param") or ""),
             payload=safe_payload,
             allowed=allowed,
@@ -204,7 +211,7 @@ class LLMPayloadAdvisor:
             except Exception as exc:
                 llm_error = str(exc)
         elif self.settings.llm_enabled:
-            llm_error = "本地/内网目标默认跳过 LLM 网络调用，可设置 NOVA_LLM_ON_LOCAL_TARGETS=true 开启"
+            llm_error = "当前配置禁止对本地/内网目标调用 LLM，可设置 NOVA_LLM_ON_LOCAL_TARGETS=true 开启"
         else:
             llm_error = "LLM 未配置或不可用"
 

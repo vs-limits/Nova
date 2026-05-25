@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from backend.helper.utils import ensure_dir, write_json
+from backend.helper.vuln_types import category_group, category_label, category_sort_key
 
 
 class PayloadAgent:
@@ -29,11 +30,15 @@ class PayloadAgent:
             if report_confirmed_only
             else raw_findings
         )
-        findings = sorted(
-            findings_for_report,
-            key=lambda item: self._severity_score(item.get("severity", "Info")),
-            reverse=True,
-        )
+        findings = [
+            self._with_category_metadata(item)
+            for item in sorted(
+                findings_for_report,
+                key=lambda item: self._severity_score(item.get("severity", "Info")),
+                reverse=True,
+            )
+        ]
+        finding_type_summary = self._finding_type_summary(findings)
         raw_llm_advice = payload_result.get("llm_payload_advice", [])
         llm_advice = raw_llm_advice
         if report_confirmed_only and not findings:
@@ -57,9 +62,11 @@ class PayloadAgent:
                 "suspected": len([item for item in raw_findings if item.get("status") == "疑似漏洞"]),
                 "llm_payload_allowed": len([item for item in llm_advice if item.get("allowed")]),
                 "llm_payload_blocked": len([item for item in llm_advice if not item.get("allowed")]),
+                "finding_types": finding_type_summary,
             },
             "target_probe": target_probe,
             "findings": findings,
+            "finding_types": finding_type_summary,
             "llm_payload_advice": llm_advice,
             "llm_payload_summary": llm_summary,
             "artifacts": {
@@ -100,6 +107,54 @@ class PayloadAgent:
             return "Low"
         return "Info"
 
+    def _with_category_metadata(self, finding: dict) -> dict:
+        item = dict(finding)
+        category = str(item.get("category") or "unknown")
+        item.setdefault("category_label", category_label(category))
+        item.setdefault("category_group", category_group(category))
+        return item
+
+    def _finding_type_summary(self, findings: list[dict]) -> list[dict[str, Any]]:
+        counts: dict[str, int] = {}
+        severities: dict[str, str] = {}
+        for finding in findings:
+            category = str(finding.get("category") or "unknown")
+            counts[category] = counts.get(category, 0) + 1
+            current = severities.get(category, "Info")
+            if self._severity_score(str(finding.get("severity", "Info"))) > self._severity_score(current):
+                severities[category] = str(finding.get("severity", "Info"))
+
+        return [
+            {
+                "category": category,
+                "label": category_label(category),
+                "group": category_group(category),
+                "count": counts[category],
+                "max_severity": severities.get(category, "Info"),
+            }
+            for category in sorted(counts, key=category_sort_key)
+        ]
+
+    def _group_findings_by_type(self, findings: list[dict]) -> dict[str, list[dict]]:
+        grouped: dict[str, list[dict]] = defaultdict(list)
+        for finding in findings:
+            grouped[str(finding.get("category") or "unknown")].append(finding)
+        return dict(sorted(grouped.items(), key=lambda item: category_sort_key(item[0])))
+
+    def _finding_type_section(self, report: dict) -> list[str]:
+        finding_types = report.get("finding_types", [])
+        lines = ["## 漏洞类型汇总", ""]
+        if not finding_types:
+            lines.extend(["本次报告没有需要展示的漏洞类型。", ""])
+            return lines
+
+        for item in finding_types:
+            lines.append(
+                f"- {item.get('label')}：{item.get('count')} 项，最高严重性 {item.get('max_severity')}，分组 {item.get('group')}"
+            )
+        lines.append("")
+        return lines
+
     def _markdown(self, report: dict) -> str:
         summary = report["summary"]
         probe = report.get("target_probe", {})
@@ -130,31 +185,36 @@ class PayloadAgent:
             f"- 跳转次数：{len(probe.get('redirect_chain', []))}",
             f"- 探测错误：{'; '.join(probe.get('probe_errors', [])) or '无'}",
             "",
-            "## 发现项",
-            "",
         ]
+
+        lines.extend(self._finding_type_section(report))
+        lines.extend(["## 发现项", ""])
 
         if not report["findings"]:
             lines.extend(["未发现明显风险。", ""])
         else:
-            for finding in report["findings"]:
-                lines.extend(
-                    [
-                        f"### [{finding['severity']}] {finding['title']}",
-                        "",
-                        f"- 编号：{finding['id']}",
-                        f"- 状态：{finding.get('status', 'N/A')}",
-                        f"- 类型：{finding.get('category', 'N/A')}",
-                        f"- 置信度：{finding['confidence']}",
-                        f"- URL：{finding.get('url', 'N/A')}",
-                        f"- 证据：{finding.get('evidence', 'N/A')}",
-                        f"- 已执行 payload：{', '.join(finding.get('payloads', [])) or 'N/A'}",
-                        f"- 请求/响应摘要：{self._format_evidence(finding.get('request_response', {}))}",
-                        f"- 修复建议：{finding.get('recommendation', 'N/A')}",
-                        f"- LLM 分析：{finding.get('llm_analysis', 'N/A') or 'N/A'}",
-                        "",
-                    ]
-                )
+            for category, typed_findings in self._group_findings_by_type(report["findings"]).items():
+                lines.extend([f"### {category_label(category)}", ""])
+                for finding in typed_findings:
+                    lines.extend(
+                        [
+                            f"#### [{finding['severity']}] {finding['title']}",
+                            "",
+                            f"- 编号：{finding['id']}",
+                            f"- 状态：{finding.get('status', 'N/A')}",
+                            f"- 漏洞类型：{finding.get('category_label') or category_label(finding.get('category'))}",
+                            f"- 类型标识：{finding.get('category', 'N/A')}",
+                            f"- 类型分组：{finding.get('category_group') or category_group(finding.get('category'))}",
+                            f"- 置信度：{finding['confidence']}",
+                            f"- URL：{finding.get('url', 'N/A')}",
+                            f"- 证据：{finding.get('evidence', 'N/A')}",
+                            f"- 已执行 payload：{', '.join(finding.get('payloads', [])) or 'N/A'}",
+                            f"- 请求/响应摘要：{self._format_evidence(finding.get('request_response', {}))}",
+                            f"- 修复建议：{finding.get('recommendation', 'N/A')}",
+                            f"- LLM 分析：{finding.get('llm_analysis', 'N/A') or 'N/A'}",
+                            "",
+                        ]
+                    )
 
         lines.extend(self._candidate_payload_section(report))
         return "\n".join(lines) + "\n"
@@ -209,7 +269,7 @@ class PayloadAgent:
                     first = pair_items[0]
                     lines.extend(
                         [
-                            f"- 类型：{first.get('category', 'unknown')} 成对候选（{pair_id}）",
+                            f"- 类型：{category_label(first.get('category'))}（{first.get('category', 'unknown')}）成对候选（{pair_id}）",
                             f"- 参数：{first.get('target_param') or 'N/A'}",
                             f"- 来源：{first.get('source', 'llm')}",
                         ]
@@ -229,7 +289,7 @@ class PayloadAgent:
                 for item in singles:
                     lines.extend(
                         [
-                            f"- 类型：{item.get('category', 'unknown')}",
+                            f"- 类型：{category_label(item.get('category'))}（{item.get('category', 'unknown')}）",
                             f"- 参数：{item.get('target_param') or 'N/A'}",
                             f"- 来源：{item.get('source', 'llm')}",
                             f"- 候选 payload：`{item.get('payload', '')}`",
@@ -251,7 +311,7 @@ class PayloadAgent:
             lines.append("已过滤 payload 只展示摘要，不作为可直接复现步骤：")
             for item in blocked[:10]:
                 lines.append(
-                    f"- 类型：{item.get('category', 'unknown')}；参数：{item.get('target_param') or 'N/A'}；摘要：`{item.get('payload')}`；原因：{item.get('filter_reason')}"
+                    f"- 类型：{category_label(item.get('category'))}（{item.get('category', 'unknown')}）；参数：{item.get('target_param') or 'N/A'}；摘要：`{item.get('payload')}`；原因：{item.get('filter_reason')}"
                 )
             lines.append("")
         return lines
