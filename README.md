@@ -89,7 +89,9 @@ NOVA 第一版优先支持用户提供登录态：
 NOVA 支持两类候选 payload 来源：
 
 - `local_template`：本地上下文模板，根据 URL、参数名、输入类型和发现项生成。
+- `local_progression_template`：漏洞已经由本地规则确认后，根据响应证据生成只读推进候选，例如 SQLi 的列数、UNION 回显位、库名/表名/字段名枚举参考。
 - `llm`：由 LLM 根据页面上下文、输入点和已有 findings 生成。
+- `llm_progression`：漏洞已经确认后，由 LLM 基于确认漏洞证据生成后续推进候选。
 
 候选 payload 第一版仅写入报告，不自动执行，也不参与漏洞确认。所有候选必须经过本地 Safety Filter。
 
@@ -194,6 +196,8 @@ python main.py --url http://127.0.0.1/sqli-labs-master/Less-1/?id=1
 ```
 
 确认 SQLi 后，NOVA 会继续做授权靶场内的轻量后续验证，包括 `ORDER BY` 列数探测和 `UNION SELECT` 回显标记探测，并把实际执行过的 payload 写入确认漏洞。
+
+如果确认结果中拿到了列数和回显位，报告的“候选 Payload”章节还会给出推进型参考，例如读取当前库名、数据库版本、当前用户、当前库表名和字段名的只读 `UNION SELECT` 候选。LLM 可用且目标允许调用时，NOVA 会额外调用 LLM 生成 `llm_progression` 候选；这些候选仍然只写入报告，不会自动执行，也不能替代本地响应证据。
 
 ## 手动运行单个 Agent
 

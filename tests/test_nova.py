@@ -566,6 +566,35 @@ def test_llm_payload_safety_filter_allows_blind_pair_and_blocks_dangerous_payloa
     assert all(item["payload"].startswith("[已过滤]") for item in blocked)
 
 
+def test_llm_payload_safety_filter_allows_read_only_sqli_progression() -> None:
+    filter_ = PayloadSafetyFilter()
+    results = filter_.filter_many(
+        [
+            {
+                "input_point": "http://example.com/Less-1/?id=1",
+                "category": "sqli_progression",
+                "target_param": "id",
+                "payload": "-1' UNION SELECT 1,database(),version()-- ",
+                "purpose": "确认 SQLi 后读取库名和版本",
+            },
+            {
+                "input_point": "http://example.com/Less-1/?id=1",
+                "category": "sqli_progression",
+                "target_param": "id",
+                "payload": "1' UNION SELECT LOAD_FILE('/etc/passwd')-- ",
+            },
+        ]
+    )
+
+    allowed = [item for item in results if item["allowed"]]
+    blocked = [item for item in results if not item["allowed"]]
+    assert len(allowed) == 1
+    assert allowed[0]["category"] == "sqli"
+    assert "database()" in allowed[0]["payload"]
+    assert len(blocked) == 1
+    assert "LOAD_FILE" in blocked[0]["filter_reason"]
+
+
 def test_llm_payload_advisor_parses_json_and_does_not_change_findings(monkeypatch) -> None:
     def fake_chat(self, system_prompt: str, user_prompt: str) -> str:
         return """
@@ -599,6 +628,112 @@ def test_llm_payload_advisor_parses_json_and_does_not_change_findings(monkeypatc
     assert result["summary"]["allowed"] >= 2
     assert result["items"][0]["allowed"] is True
     assert findings[0]["status"] == "待验证"
+
+
+def test_payload_advisor_adds_confirmed_sqli_progression_templates(monkeypatch) -> None:
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("local targets should skip LLM network calls by default")
+
+    monkeypatch.setattr("backend.helper.llm.client.LLMClient.chat", fail_if_called)
+    webscan = {
+        "target": "http://127.0.0.1/sqli-labs-master/Less-1/?id=1",
+        "final_url": "http://127.0.0.1/sqli-labs-master/Less-1/?id=1",
+        "pages": [
+            {
+                "final_url": "http://127.0.0.1/sqli-labs-master/Less-1/?id=1",
+                "input_points": [
+                    {
+                        "name": "id",
+                        "method": "GET",
+                        "url": "http://127.0.0.1/sqli-labs-master/Less-1/?id=1",
+                        "active_testable": True,
+                        "type": "text",
+                    }
+                ],
+            }
+        ],
+    }
+    findings = [
+        {
+            "id": "NOVA-SQLI-001",
+            "title": "确认存在 SQL 注入错误回显",
+            "status": "确认漏洞",
+            "category": "sqli",
+            "url": "http://127.0.0.1/sqli-labs-master/Less-1/?id=1%27",
+            "payloads": ["1'", "1' ORDER BY 1-- ", "-1' UNION SELECT 'NOVA1','NOVA2','NOVA3'-- "],
+            "request_response": {
+                "followup": {
+                    "column_count": 3,
+                    "union_probe": {"reflected_markers": ["NOVA2", "NOVA3"]},
+                    "union_marker_reflected": True,
+                }
+            },
+        }
+    ]
+
+    result = LLMPayloadAdvisor(settings(llm_baseurl="http://llm.local", llm_apikey="k", llm_provider="deepseek")).generate(
+        webscan,
+        findings,
+    )
+
+    allowed = [item for item in result["items"] if item["allowed"]]
+    progression = [item for item in allowed if item["source"] == "local_progression_template"]
+    assert progression
+    assert any("database()" in item["payload"] for item in progression)
+    assert any("information_schema.tables" in item["payload"] for item in progression)
+    assert {item["target_param"] for item in progression} == {"id"}
+
+
+def test_llm_payload_advisor_calls_progression_prompt_for_confirmed_findings(monkeypatch) -> None:
+    calls: list[str] = []
+
+    def fake_chat(self, system_prompt: str, user_prompt: str) -> str:
+        calls.append(system_prompt)
+        if "Confirmed Vulnerability Payload Advisor" not in system_prompt:
+            return '{"payloads": []}'
+        assert "column_count" in user_prompt
+        return """
+        {
+          "payloads": [
+            {
+              "input_point": "http://example.com/Less-1/?id=1",
+              "category": "sqli_progression",
+              "target_param": "id",
+              "payload": "-1' UNION SELECT 1,database(),3-- ",
+              "purpose": "确认后读取当前数据库名",
+              "expected_signal": "响应中出现数据库名",
+              "risk_note": "仅报告参考，不自动执行"
+            }
+          ]
+        }
+        """
+
+    monkeypatch.setattr("backend.helper.llm.client.LLMClient.chat", fake_chat)
+    webscan = {
+        "target": "http://example.com/Less-1/?id=1",
+        "final_url": "http://example.com/Less-1/?id=1",
+        "pages": [{"input_points": [{"name": "id", "method": "GET", "url": "http://example.com/Less-1/?id=1"}]}],
+    }
+    findings = [
+        {
+            "id": "NOVA-SQLI-001",
+            "title": "确认存在 SQL 注入错误回显",
+            "status": "确认漏洞",
+            "category": "sqli",
+            "url": "http://example.com/Less-1/?id=1%27",
+            "payloads": ["1'"],
+            "request_response": {"followup": {"column_count": 3, "union_probe": {"reflected_markers": ["NOVA2"]}}},
+        }
+    ]
+
+    result = LLMPayloadAdvisor(settings(llm_baseurl="http://llm.local", llm_apikey="k", llm_provider="deepseek")).generate(
+        webscan,
+        findings,
+    )
+
+    assert len(calls) == 2
+    assert result["summary"]["llm_candidates"] == 1
+    assert any(item["source"] == "llm_progression" and "database()" in item["payload"] for item in result["items"])
 
 
 def test_payload_advisor_adds_contextual_pairs_and_does_not_target_submit(monkeypatch) -> None:

