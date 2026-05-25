@@ -303,7 +303,7 @@ def test_auditor_error_sqli_runs_order_by_and_union_followup(monkeypatch) -> Non
         value = parse_qs(urlparse(url).query).get("id", [""])[0]
         lowered = value.lower()
         if value == "1'":
-            return Response(url, "You have an error in your SQL syntax")
+            return Response(url, "You have an error in your SQL syntax; MySQL server version")
         if "order by 4" in lowered:
             return Response(url, "Unknown column '4' in 'order clause'")
         if "order by" in lowered:
@@ -342,10 +342,14 @@ def test_auditor_error_sqli_runs_order_by_and_union_followup(monkeypatch) -> Non
     finding = next(item for item in audit["findings"] if item["status"] == "确认漏洞")
 
     assert finding["payloads"][0] == "1'"
-    assert "1' ORDER BY 4-- " in finding["payloads"]
-    assert "-1' UNION SELECT 'NOVA1','NOVA2','NOVA3'-- " in finding["payloads"]
+    assert "1' ORDER BY 4 -- -" in finding["payloads"]
+    assert "-1' UNION SELECT 'NOVA1','NOVA2','NOVA3' -- -" in finding["payloads"]
     assert finding["request_response"]["followup"]["column_count"] == 3
     assert finding["request_response"]["followup"]["union_marker_reflected"] is True
+    assert finding["details"]["dbms_guess"] == "MySQL/MariaDB"
+    assert finding["details"]["injection_context"] == "单引号字符串闭合"
+    assert finding["details"]["comment_suffix"] == "-- -"
+    assert finding["details"]["visible_columns"] == [2, 3]
 
 
 def test_auditor_detects_boolean_sqli(monkeypatch) -> None:
@@ -549,8 +553,8 @@ def test_llm_payload_safety_filter_allows_blind_pair_and_blocks_dangerous_payloa
             "input_point": "http://127.0.0.1/DVWA/vulnerabilities/sqli_blind/",
             "category": "sqli_blind",
             "target_param": "id",
-            "true_payload": "1' AND '1'='1' #",
-            "false_payload": "1' AND '1'='2' #",
+            "true_payload": "1' AND '1'='1' -- -",
+            "false_payload": "1' AND '1'='2' -- -",
             "expected_true_signal": "User ID exists in the database.",
             "expected_false_signal": "User ID is MISSING from the database.",
             "purpose": "验证布尔条件响应差异",
@@ -567,7 +571,7 @@ def test_llm_payload_safety_filter_allows_blind_pair_and_blocks_dangerous_payloa
     blocked = [item for item in results if not item["allowed"]]
     assert len(allowed) == 2
     assert {item["pair_role"] for item in allowed} == {"true", "false"}
-    assert "1' AND '1'='1' #" in {item["payload"] for item in allowed}
+    assert "1' AND '1'='1' -- -" in {item["payload"] for item in allowed}
     assert len(blocked) == 4
     assert all(item["payload"].startswith("[已过滤]") for item in blocked)
 
@@ -580,14 +584,14 @@ def test_llm_payload_safety_filter_allows_read_only_sqli_progression() -> None:
                 "input_point": "http://example.com/Less-1/?id=1",
                 "category": "sqli_progression",
                 "target_param": "id",
-                "payload": "-1' UNION SELECT 1,database(),version()-- ",
+                "payload": "-1' UNION SELECT 1,database(),version() -- -",
                 "purpose": "确认 SQLi 后读取库名和版本",
             },
             {
                 "input_point": "http://example.com/Less-1/?id=1",
                 "category": "sqli_progression",
                 "target_param": "id",
-                "payload": "1' UNION SELECT LOAD_FILE('/etc/passwd')-- ",
+                "payload": "1' UNION SELECT LOAD_FILE('/etc/passwd') -- -",
             },
         ]
     )
@@ -598,6 +602,7 @@ def test_llm_payload_safety_filter_allows_read_only_sqli_progression() -> None:
     assert allowed[0]["category"] == "sqli_progression"
     assert allowed[0]["category_label"] == "SQL 注入推进候选"
     assert "database()" in allowed[0]["payload"]
+    assert allowed[0]["payload"].endswith("-- -")
     assert len(blocked) == 1
     assert "LOAD_FILE" in blocked[0]["filter_reason"]
 
@@ -611,8 +616,8 @@ def test_llm_payload_advisor_parses_json_and_does_not_change_findings(monkeypatc
               "input_point": "http://example.com/sqli_blind/",
               "category": "sqli_blind",
               "target_param": "id",
-              "true_payload": "1' AND '1'='1' #",
-              "false_payload": "1' AND '1'='2' #",
+              "true_payload": "1' AND '1'='1' -- -",
+              "false_payload": "1' AND '1'='2' -- -",
               "expected_true_signal": "exists",
               "expected_false_signal": "MISSING",
               "purpose": "验证盲注布尔差异"
@@ -667,7 +672,7 @@ def test_payload_advisor_adds_confirmed_sqli_progression_templates(monkeypatch) 
             "status": "确认漏洞",
             "category": "sqli",
             "url": "http://127.0.0.1/sqli-labs-master/Less-1/?id=1%27",
-            "payloads": ["1'", "1' ORDER BY 1-- ", "-1' UNION SELECT 'NOVA1','NOVA2','NOVA3'-- "],
+            "payloads": ["1'", "1' ORDER BY 1 -- -", "-1' UNION SELECT 'NOVA1','NOVA2','NOVA3' -- -"],
             "request_response": {
                 "followup": {
                     "column_count": 3,
@@ -708,7 +713,7 @@ def test_llm_payload_advisor_calls_progression_prompt_for_confirmed_findings(mon
               "input_point": "http://example.com/Less-1/?id=1",
               "category": "sqli_progression",
               "target_param": "id",
-              "payload": "-1' UNION SELECT 1,database(),3-- ",
+              "payload": "-1' UNION SELECT 1,database(),3 -- -",
               "purpose": "确认后读取当前数据库名",
               "expected_signal": "响应中出现数据库名",
               "risk_note": "仅报告参考，不自动执行"
@@ -828,7 +833,7 @@ def test_report_contains_probe_payloads_status_evidence_and_llm_advice(tmp_path:
                 "input_point": "http://example.com/?q=1",
                 "category": "sqli_blind",
                 "target_param": "q",
-                "payload": "1' AND '1'='1' #",
+                "payload": "1' AND '1'='1' -- -",
                 "allowed": True,
                 "filter_reason": "通过本地非破坏性 Safety Filter",
                 "purpose": "验证布尔条件响应差异",
@@ -892,7 +897,7 @@ def test_report_contains_probe_payloads_status_evidence_and_llm_advice(tmp_path:
     assert "status=200" in markdown
     assert "' OR '1'='1" in markdown
     assert "## 候选 Payload" in markdown
-    assert "1' AND '1'='1' #" in markdown
+    assert "1' AND '1'='1' -- -" in markdown
     assert "包含破坏性 SQL 关键字 DROP" in markdown
     assert "Bearer secret" not in markdown
 
@@ -926,7 +931,7 @@ def test_report_hides_non_confirmed_findings_by_default(tmp_path: Path, monkeypa
                 "category": "sqli",
                 "url": "http://example.com/?q=1",
                 "evidence": "SQL error",
-                "payloads": ["1'", "1' ORDER BY 1-- "],
+                "payloads": ["1'", "1' ORDER BY 1 -- -"],
                 "request_response": {},
                 "recommendation": "use prepared statements",
                 "llm_analysis": "",

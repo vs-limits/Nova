@@ -208,6 +208,7 @@ class PayloadAgent:
                             f"- 置信度：{finding['confidence']}",
                             f"- URL：{finding.get('url', 'N/A')}",
                             f"- 证据：{finding.get('evidence', 'N/A')}",
+                            f"- 漏洞细化：{self._format_details(finding.get('details') or finding.get('request_response', {}).get('sqli_details', {}))}",
                             f"- 已执行 payload：{', '.join(finding.get('payloads', [])) or 'N/A'}",
                             f"- 请求/响应摘要：{self._format_evidence(finding.get('request_response', {}))}",
                             f"- 修复建议：{finding.get('recommendation', 'N/A')}",
@@ -218,6 +219,26 @@ class PayloadAgent:
 
         lines.extend(self._candidate_payload_section(report))
         return "\n".join(lines) + "\n"
+
+    def _format_details(self, details: dict[str, Any]) -> str:
+        if not details:
+            return "N/A"
+        parts = []
+        if details.get("dbms_guess"):
+            parts.append(f"数据库类型={details.get('dbms_guess')}")
+        if details.get("injection_context"):
+            parts.append(f"注入上下文={details.get('injection_context')}")
+        if details.get("column_count"):
+            parts.append(f"列数={details.get('column_count')}")
+        if details.get("visible_columns"):
+            parts.append(f"回显列={', '.join(str(item) for item in details.get('visible_columns', []))}")
+        if details.get("comment_suffix"):
+            parts.append(f"注释后缀={details.get('comment_suffix')}")
+        if details.get("payload_pattern"):
+            parts.append(f"推荐模式={details.get('payload_pattern')}")
+        if details.get("techniques"):
+            parts.append(f"验证技术={', '.join(details.get('techniques', []))}")
+        return "；".join(parts) if parts else "N/A"
 
     def _candidate_payload_section(self, report: dict) -> list[str]:
         advice = report.get("llm_payload_advice", [])

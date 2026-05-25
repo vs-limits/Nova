@@ -201,6 +201,14 @@ python main.py --url http://127.0.0.1/sqli-labs-master/Less-1/?id=1
 
 如果确认结果中拿到了列数和回显位，报告的“候选 Payload”章节还会给出推进型参考，例如读取当前库名、数据库版本、当前用户、当前库表名和字段名的只读 `UNION SELECT` 候选。LLM 可用且目标允许调用时，NOVA 会额外调用 LLM 生成 `llm_progression` 候选；这些候选仍然只写入报告，不会自动执行，也不能替代本地响应证据。
 
+对 sqli-labs Less-1 这类 MySQL 单引号字符串型注入，NOVA 会使用可复制的 `-- -` 注释后缀，例如：
+
+```text
+-1' UNION SELECT 1,database(),3 -- -
+```
+
+不要把后缀简化成 `--`。MySQL 的 `--` 注释需要后面跟空白字符；如果注释没有生效，原始 SQL 后面的 `LIMIT 0,1` 会继续拼接，常见报错就是 `near '' LIMIT 0,1`。
+
 本地靶场现在默认允许 LLM 调用。如果你不希望把本地目标上下文发送给 LLM，可以显式关闭：
 
 ```bash

