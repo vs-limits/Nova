@@ -25,6 +25,10 @@ def settings(**overrides) -> RuntimeSettings:
         "max_depth": 1,
         "rate_limit": 0,
         "active_scan": False,
+        "active_request_timeout": 1,
+        "max_active_inputs": 5,
+        "llm_analysis": True,
+        "llm_on_local_targets": False,
         "llm_payload_advisor": True,
         "llm_payload_max_per_param": 5,
         "llm_payload_report_only": True,
@@ -331,6 +335,91 @@ def test_auditor_detects_boolean_sqli(monkeypatch) -> None:
     assert audit["summary"]["suspected"] == 1
 
 
+def test_auditor_short_circuits_active_probe_when_baseline_times_out(monkeypatch) -> None:
+    calls = []
+
+    def fake_urlopen(request, **_kwargs):
+        calls.append(request.full_url)
+        raise TimeoutError("timeout")
+
+    monkeypatch.setattr("backend.helper.agent.sub_agent.auditor.urlopen", fake_urlopen)
+    webscan = {
+        "target": "http://127.0.0.1/sqli-labs-master/Less-1/",
+        "reachable": True,
+        "headers": {
+            "Content-Security-Policy": "default-src 'self'",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+        "cookies": [],
+        "forms": [],
+        "pages": [
+            {
+                "final_url": "http://127.0.0.1/sqli-labs-master/Less-1/?id=1",
+                "input_points": [
+                    {
+                        "name": "id",
+                        "method": "GET",
+                        "url": "http://127.0.0.1/sqli-labs-master/Less-1/?id=1",
+                        "active_testable": True,
+                    }
+                ],
+            }
+        ],
+    }
+
+    audit = AuditorAgent(settings(active_scan=True, active_request_timeout=0.5)).audit(webscan)
+
+    assert len(calls) == 1
+    assert any(item["title"] == "输入点主动探测请求失败或超时" for item in audit["findings"])
+
+
+def test_auditor_limits_active_input_points(monkeypatch) -> None:
+    class Headers(dict):
+        def get_content_charset(self):
+            return "utf-8"
+
+    class Response:
+        status = 200
+        headers = Headers({"Content-Type": "text/html"})
+
+        def __init__(self, url: str) -> None:
+            self.url = url
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, *_):
+            return b"baseline"
+
+    monkeypatch.setattr("backend.helper.agent.sub_agent.auditor.urlopen", lambda request, **_kwargs: Response(request.full_url))
+    points = [
+        {"name": f"q{i}", "method": "GET", "url": f"http://example.com/?q{i}=1", "active_testable": True}
+        for i in range(3)
+    ]
+    webscan = {
+        "target": "http://example.com/",
+        "reachable": True,
+        "headers": {
+            "Content-Security-Policy": "default-src 'self'",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+        "cookies": [],
+        "forms": [],
+        "pages": [{"input_points": points}],
+    }
+
+    audit = AuditorAgent(settings(active_scan=True, max_active_inputs=1)).audit(webscan)
+
+    assert any(item["title"] == "主动探测输入点数量达到上限" for item in audit["findings"])
+
+
 def test_auditor_rules_detect_headers_cookies_forms_and_query() -> None:
     webscan = {
         "target": "http://example.com/?q=1",
@@ -441,7 +530,10 @@ def test_llm_payload_advisor_parses_json_and_does_not_change_findings(monkeypatc
 
 
 def test_payload_advisor_adds_contextual_pairs_and_does_not_target_submit(monkeypatch) -> None:
-    monkeypatch.setattr("backend.helper.llm.client.LLMClient.chat", lambda *_args, **_kwargs: '{"payloads": []}')
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("local targets should skip LLM network calls by default")
+
+    monkeypatch.setattr("backend.helper.llm.client.LLMClient.chat", fail_if_called)
     webscan = {
         "target": "http://127.0.0.1/DVWA/vulnerabilities/sqli_blind/",
         "final_url": "http://127.0.0.1/DVWA/vulnerabilities/sqli_blind/",

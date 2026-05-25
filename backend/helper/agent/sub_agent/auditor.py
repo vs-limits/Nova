@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import ipaddress
 import json
 import re
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
@@ -41,6 +42,7 @@ class AuditorAgent:
         self.settings = settings or load_runtime_settings()
         self.llm = LLMClient(self.settings)
         self.payload_advisor = LLMPayloadAdvisor(self.settings)
+        self._last_probe_failed = False
 
     def audit(self, webscan: dict) -> dict:
         findings: list[dict] = []
@@ -211,6 +213,7 @@ class AuditorAgent:
     def _check_input_points(self, pages: list[dict]) -> list[dict]:
         findings: list[dict] = []
         seen: set[tuple[str, str]] = set()
+        active_inputs = 0
         for page in pages:
             for input_point in page.get("input_points", []):
                 if input_point.get("method", "GET").upper() != "GET":
@@ -226,8 +229,25 @@ class AuditorAgent:
 
                 if not input_point.get("active_testable", True):
                     continue
+                active_inputs += 1
+                if active_inputs > self.settings.max_active_inputs:
+                    findings.append(
+                        self._finding(
+                            self._new_id("Q", len(findings) + 1),
+                            "主动探测输入点数量达到上限",
+                            "Info",
+                            "High",
+                            "scanner_limit",
+                            url,
+                            f"为避免靶场或本地服务卡死，本次最多主动探测 {self.settings.max_active_inputs} 个输入点，后续输入点已跳过。",
+                            payloads=[],
+                            status=STATUS_NOTICE,
+                        )
+                    )
+                    return findings
 
                 context_params = input_point.get("form_defaults", {})
+                self._last_probe_failed = False
                 sqli_finding = (
                     self._probe_sqli(url, name, context_params, len(findings) + 1)
                     if self.settings.active_scan
@@ -235,6 +255,21 @@ class AuditorAgent:
                 )
                 if sqli_finding:
                     findings.append(sqli_finding)
+                    continue
+                if self._last_probe_failed:
+                    findings.append(
+                        self._finding(
+                            self._new_id("Q", len(findings) + 1),
+                            "输入点主动探测请求失败或超时",
+                            "Info",
+                            "Medium",
+                            "scanner_limit",
+                            url,
+                            f"参数 {name} 的基线或单引号探测请求失败，NOVA 已停止对该输入点继续发送更多 payload，避免扫描长时间卡住。",
+                            payloads=[],
+                            status=STATUS_NOTICE,
+                        )
+                    )
                     continue
 
                 reflection = (
@@ -262,8 +297,15 @@ class AuditorAgent:
         return findings
 
     def _probe_sqli(self, url: str, param: str, context_params: dict, finding_index: int) -> dict | None:
+        self._last_probe_failed = False
         baseline = self._http_get(self._mutate_url(url, param, "1", context_params))
+        if not baseline:
+            self._last_probe_failed = True
+            return None
         quote_probe = self._http_get(self._mutate_url(url, param, "1'", context_params))
+        if not quote_probe:
+            self._last_probe_failed = True
+            return None
         if quote_probe and self._has_sql_error(quote_probe.get("body", "")):
             return self._finding(
                 self._new_id("SQLI", finding_index),
@@ -286,6 +328,9 @@ class AuditorAgent:
         for true_payload, false_payload in payload_pairs:
             true_probe = self._http_get(self._mutate_url(url, param, true_payload, context_params))
             false_probe = self._http_get(self._mutate_url(url, param, false_payload, context_params))
+            if not true_probe or not false_probe:
+                self._last_probe_failed = True
+                return None
             if baseline and true_probe and false_probe:
                 true_score = self._similarity_score(baseline["body"], true_probe["body"])
                 false_score = self._similarity_score(baseline["body"], false_probe["body"])
@@ -336,7 +381,8 @@ class AuditorAgent:
                 headers={"User-Agent": "NOVA-safe-scanner/1.0", **self.settings.auth_headers},
                 method="GET",
             )
-            with urlopen(request, timeout=self.settings.request_timeout) as response:
+            timeout = max(0.5, min(float(self.settings.request_timeout), float(self.settings.active_request_timeout)))
+            with urlopen(request, timeout=timeout) as response:
                 body = response.read(300000).decode(
                     response.headers.get_content_charset() or "utf-8",
                     errors="replace",
@@ -411,7 +457,7 @@ class AuditorAgent:
         return not webscan.get("auth", {}).get("configured")
 
     def _llm_analysis(self, webscan: dict, findings: list[dict]) -> dict:
-        if not self.settings.llm_enabled:
+        if not self.settings.llm_enabled or not self.settings.llm_analysis or not self._should_call_llm(webscan):
             return {}
 
         system_prompt = (
@@ -533,3 +579,16 @@ class AuditorAgent:
     def _extract_json(self, raw: str) -> str:
         match = re.search(r"\{.*\}", raw, re.S)
         return match.group(0) if match else raw
+
+    def _should_call_llm(self, webscan: dict) -> bool:
+        if self.settings.llm_on_local_targets:
+            return True
+        target = str(webscan.get("final_url") or webscan.get("target") or "")
+        host = urlparse(target).hostname or ""
+        if host.lower() in {"localhost"}:
+            return False
+        try:
+            address = ipaddress.ip_address(host)
+            return not (address.is_loopback or address.is_private or address.is_link_local)
+        except ValueError:
+            return True

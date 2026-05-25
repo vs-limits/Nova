@@ -135,11 +135,15 @@ false: 1' AND '1'='2' #
 | `NOVA_REQUEST_TIMEOUT` | `10` | 请求和 LLM 调用超时时间，单位秒 |
 | `NOVA_RATE_LIMIT` | `0.2` | 爬虫请求间隔，单位秒 |
 | `NOVA_ACTIVE_SCAN` | `true` | 是否启用安全 GET 参数探测 |
+| `NOVA_ACTIVE_REQUEST_TIMEOUT` | `3.0` | 主动探测单个 payload 请求超时，单位秒 |
+| `NOVA_MAX_ACTIVE_INPUTS` | `5` | 单次扫描最多主动探测的输入点数量 |
 | `NOVA_ALLOWED_HOSTS` | 空 | 额外允许扫描的主机列表，英文逗号分隔 |
 | `NOVA_EXCLUDE_PATHS` | 空 | 排除路径前缀，英文逗号分隔 |
 | `NOVA_AUTH_HEADERS_FILE` | 空 | 认证 Header JSON 文件 |
 | `NOVA_BASIC_USER` | 空 | HTTP Basic Auth 用户名 |
 | `NOVA_BASIC_PASS` | 空 | HTTP Basic Auth 密码 |
+| `NOVA_LLM_ANALYSIS` | `true` | 是否启用 LLM 对 findings 的中文分析补充 |
+| `NOVA_LLM_ON_LOCAL_TARGETS` | `false` | 是否允许对 localhost、127.0.0.1、内网地址调用 LLM |
 | `NOVA_LLM_PAYLOAD_ADVISOR` | `true` | 是否启用候选 payload 生成 |
 | `NOVA_LLM_PAYLOAD_MAX_PER_PARAM` | `5` | 每个参数最多保留的候选数量 |
 | `NOVA_LLM_PAYLOAD_REPORT_ONLY` | `true` | 候选 payload 是否仅报告。第一版按仅报告处理 |
@@ -167,6 +171,20 @@ python main.py --url http://127.0.0.1/DVWA/vulnerabilities/xss_r/ --cookie "PHPS
 ```
 
 如果登录态有效，NOVA 会识别 DVWA 页面中的 GET 表单参数，并尝试用本地规则验证 SQLi 或 XSS 反射风险。候选 payload 会写入报告，但不会自动执行。
+
+本地靶场如果响应较慢或某些 payload 触发长时间等待，可以收紧主动探测预算：
+
+```bash
+set NOVA_ACTIVE_REQUEST_TIMEOUT=1
+set NOVA_MAX_ACTIVE_INPUTS=2
+python main.py --url http://127.0.0.1/sqli-labs-master/Less-1/
+```
+
+Linux/macOS 使用：
+
+```bash
+NOVA_ACTIVE_REQUEST_TIMEOUT=1 NOVA_MAX_ACTIVE_INPUTS=2 python main.py --url http://127.0.0.1/sqli-labs-master/Less-1/
+```
 
 ## 手动运行单个 Agent
 

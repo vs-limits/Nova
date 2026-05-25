@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import ipaddress
 import json
 import re
 from typing import Any
@@ -179,7 +180,7 @@ class LLMPayloadAdvisor:
         llm_candidates: list[dict[str, Any]] = []
         llm_error = ""
 
-        if self.settings.llm_enabled:
+        if self.settings.llm_enabled and self._should_call_llm(webscan):
             try:
                 raw = self.llm.chat(self._system_prompt(), self._user_prompt(webscan, findings))
                 llm_candidates = self._parse_candidates(raw)
@@ -187,6 +188,8 @@ class LLMPayloadAdvisor:
                     item.setdefault("source", "llm")
             except Exception as exc:
                 llm_error = str(exc)
+        elif self.settings.llm_enabled:
+            llm_error = "本地/内网目标默认跳过 LLM 网络调用，可设置 NOVA_LLM_ON_LOCAL_TARGETS=true 开启"
         else:
             llm_error = "LLM 未配置或不可用"
 
@@ -225,6 +228,19 @@ class LLMPayloadAdvisor:
             "items": [],
             "summary": {"generated": 0, "allowed": 0, "blocked": 0, "local_candidates": 0, "llm_candidates": 0},
         }
+
+    def _should_call_llm(self, webscan: dict) -> bool:
+        if self.settings.llm_on_local_targets:
+            return True
+        target = str(webscan.get("final_url") or webscan.get("target") or "")
+        host = urlparse(target).hostname or ""
+        if host.lower() in {"localhost"}:
+            return False
+        try:
+            address = ipaddress.ip_address(host)
+            return not (address.is_loopback or address.is_private or address.is_link_local)
+        except ValueError:
+            return True
 
     def _local_candidates(self, webscan: dict, findings: list[dict]) -> list[dict[str, Any]]:
         candidates: list[dict[str, Any]] = []
