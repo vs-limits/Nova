@@ -147,6 +147,7 @@ false: 1' AND '1'='2' #
 | `NOVA_LLM_PAYLOAD_ADVISOR` | `true` | 是否启用候选 payload 生成 |
 | `NOVA_LLM_PAYLOAD_MAX_PER_PARAM` | `5` | 每个参数最多保留的候选数量 |
 | `NOVA_LLM_PAYLOAD_REPORT_ONLY` | `true` | 候选 payload 是否仅报告。第一版按仅报告处理 |
+| `NOVA_REPORT_CONFIRMED_ONLY` | `true` | 报告是否只展示确认漏洞，默认隐藏配置建议、信息提示和待验证项 |
 
 ## 输出文件
 
@@ -185,6 +186,14 @@ Linux/macOS 使用：
 ```bash
 NOVA_ACTIVE_REQUEST_TIMEOUT=1 NOVA_MAX_ACTIVE_INPUTS=2 python main.py --url http://127.0.0.1/sqli-labs-master/Less-1/
 ```
+
+对 sqli-labs Less-1 这类错误回显 SQLi 关卡，建议带上参数入口：
+
+```bash
+python main.py --url http://127.0.0.1/sqli-labs-master/Less-1/?id=1
+```
+
+确认 SQLi 后，NOVA 会继续做授权靶场内的轻量后续验证，包括 `ORDER BY` 列数探测和 `UNION SELECT` 回显标记探测，并把实际执行过的 payload 写入确认漏洞。
 
 ## 手动运行单个 Agent
 

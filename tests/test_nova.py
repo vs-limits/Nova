@@ -32,6 +32,7 @@ def settings(**overrides) -> RuntimeSettings:
         "llm_payload_advisor": True,
         "llm_payload_max_per_param": 5,
         "llm_payload_report_only": True,
+        "report_confirmed_only": True,
         "allowed_hosts": [],
         "exclude_paths": [],
         "auth_headers": {},
@@ -268,6 +269,77 @@ def test_auditor_detects_sqli_error(monkeypatch) -> None:
 
     assert any(item["title"] == "确认存在 SQL 注入错误回显" for item in audit["findings"])
     assert audit["summary"]["confirmed"] == 1
+
+
+def test_auditor_error_sqli_runs_order_by_and_union_followup(monkeypatch) -> None:
+    class Headers(dict):
+        def get_content_charset(self):
+            return "utf-8"
+
+    class Response:
+        def __init__(self, url: str, body: str) -> None:
+            self.url = url
+            self.status = 200
+            self.headers = Headers({"Content-Type": "text/html"})
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, *_):
+            return self.body.encode("utf-8")
+
+    def fake_urlopen(request, **_kwargs):
+        url = request.full_url
+        value = parse_qs(urlparse(url).query).get("id", [""])[0]
+        lowered = value.lower()
+        if value == "1'":
+            return Response(url, "You have an error in your SQL syntax")
+        if "order by 4" in lowered:
+            return Response(url, "Unknown column '4' in 'order clause'")
+        if "order by" in lowered:
+            return Response(url, "Dumb user page")
+        if "union select" in lowered:
+            return Response(url, "Your Login name: NOVA2<br>Your Password: NOVA3")
+        return Response(url, "Dumb user page")
+
+    monkeypatch.setattr("backend.helper.agent.sub_agent.auditor.urlopen", fake_urlopen)
+    webscan = {
+        "target": "http://127.0.0.1/sqli-labs-master/Less-1/?id=1",
+        "reachable": True,
+        "headers": {
+            "Content-Security-Policy": "default-src 'self'",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+        "cookies": [],
+        "forms": [],
+        "pages": [
+            {
+                "input_points": [
+                    {
+                        "name": "id",
+                        "method": "GET",
+                        "url": "http://127.0.0.1/sqli-labs-master/Less-1/?id=1",
+                        "active_testable": True,
+                    }
+                ]
+            }
+        ],
+    }
+
+    audit = AuditorAgent(settings(active_scan=True)).audit(webscan)
+    finding = next(item for item in audit["findings"] if item["status"] == "确认漏洞")
+
+    assert finding["payloads"][0] == "1'"
+    assert "1' ORDER BY 4-- " in finding["payloads"]
+    assert "-1' UNION SELECT 'NOVA1','NOVA2','NOVA3'-- " in finding["payloads"]
+    assert finding["request_response"]["followup"]["column_count"] == 3
+    assert finding["request_response"]["followup"]["union_marker_reflected"] is True
 
 
 def test_auditor_detects_boolean_sqli(monkeypatch) -> None:
@@ -584,7 +656,8 @@ def test_llm_payload_advisor_non_json_degrades(monkeypatch) -> None:
     assert result["items"] == []
 
 
-def test_report_contains_probe_payloads_status_evidence_and_llm_advice(tmp_path: Path) -> None:
+def test_report_contains_probe_payloads_status_evidence_and_llm_advice(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("NOVA_REPORT_CONFIRMED_ONLY", "false")
     audit = {
         "target": "http://example.com/?q=1",
         "audited_at": "2026-05-22T00:00:00+00:00",
@@ -673,6 +746,60 @@ def test_report_contains_probe_payloads_status_evidence_and_llm_advice(tmp_path:
     assert "1' AND '1'='1' #" in markdown
     assert "包含破坏性 SQL 关键字 DROP" in markdown
     assert "Bearer secret" not in markdown
+
+
+def test_report_hides_non_confirmed_findings_by_default(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("NOVA_REPORT_CONFIRMED_ONLY", raising=False)
+    audit = {
+        "target": "http://example.com/?q=1",
+        "audited_at": "2026-05-22T00:00:00+00:00",
+        "findings": [
+            {
+                "id": "NOVA-H-001",
+                "title": "缺少 Content-Security-Policy 响应头",
+                "severity": "Medium",
+                "confidence": "High",
+                "status": "配置建议",
+                "category": "security_header",
+                "url": "http://example.com/",
+                "evidence": "header missing",
+                "payloads": [],
+                "request_response": {},
+                "recommendation": "fix header",
+                "llm_analysis": "",
+            },
+            {
+                "id": "NOVA-SQLI-001",
+                "title": "确认存在 SQL 注入错误回显",
+                "severity": "High",
+                "confidence": "High",
+                "status": "确认漏洞",
+                "category": "sqli",
+                "url": "http://example.com/?q=1",
+                "evidence": "SQL error",
+                "payloads": ["1'", "1' ORDER BY 1-- "],
+                "request_response": {},
+                "recommendation": "use prepared statements",
+                "llm_analysis": "",
+            },
+        ],
+        "llm_payload_advice": [],
+        "llm_payload_summary": {"enabled": False, "status": "disabled", "message": "", "report_only": True},
+    }
+
+    report, _, markdown_path = PayloadAgent().build_report(
+        "http://example.com/?q=1",
+        {"status_code": 200, "title": "Mock"},
+        audit,
+        tmp_path,
+        target_probe={"reachable": True, "auth": {}, "redirect_chain": [], "probe_errors": []},
+    )
+
+    markdown = markdown_path.read_text(encoding="utf-8-sig")
+    assert report["summary"]["total_findings"] == 1
+    assert report["summary"]["raw_total_findings"] == 2
+    assert "确认存在 SQL 注入错误回显" in markdown
+    assert "缺少 Content-Security-Policy" not in markdown
 
 
 def test_report_notes_llm_unavailable(tmp_path: Path) -> None:

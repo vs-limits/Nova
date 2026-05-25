@@ -66,6 +66,7 @@ class RuntimeSettings:
     llm_payload_advisor: bool = True
     llm_payload_max_per_param: int = 5
     llm_payload_report_only: bool = True
+    report_confirmed_only: bool = True
     allowed_hosts: list[str] = field(default_factory=list)
     exclude_paths: list[str] = field(default_factory=list)
     auth_headers: dict[str, str] = field(default_factory=dict)
@@ -108,6 +109,7 @@ def load_runtime_settings() -> RuntimeSettings:
         llm_payload_advisor=_env_bool("NOVA_LLM_PAYLOAD_ADVISOR", True),
         llm_payload_max_per_param=_env_int("NOVA_LLM_PAYLOAD_MAX_PER_PARAM", 5),
         llm_payload_report_only=_env_bool("NOVA_LLM_PAYLOAD_REPORT_ONLY", True),
+        report_confirmed_only=_env_bool("NOVA_REPORT_CONFIRMED_ONLY", True),
         allowed_hosts=_env_list("NOVA_ALLOWED_HOSTS"),
         exclude_paths=_env_list("NOVA_EXCLUDE_PATHS"),
         auth_headers=auth_headers,

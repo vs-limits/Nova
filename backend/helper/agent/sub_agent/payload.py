@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+import os
 from pathlib import Path
 from typing import Any
 
@@ -21,12 +22,22 @@ class PayloadAgent:
     ) -> tuple[dict, Path, Path]:
         ensure_dir(report_dir)
         target_probe = target_probe or webscan.get("target_probe", {})
+        raw_findings = payload_result.get("findings", [])
+        report_confirmed_only = self._env_bool("NOVA_REPORT_CONFIRMED_ONLY", True)
+        findings_for_report = (
+            [item for item in raw_findings if item.get("status") == "确认漏洞"]
+            if report_confirmed_only
+            else raw_findings
+        )
         findings = sorted(
-            payload_result.get("findings", []),
+            findings_for_report,
             key=lambda item: self._severity_score(item.get("severity", "Info")),
             reverse=True,
         )
-        llm_advice = payload_result.get("llm_payload_advice", [])
+        raw_llm_advice = payload_result.get("llm_payload_advice", [])
+        llm_advice = raw_llm_advice
+        if report_confirmed_only and not findings:
+            llm_advice = []
         llm_summary = payload_result.get("llm_payload_summary", {})
         report = {
             "agent": "Auditor Agent",
@@ -37,11 +48,13 @@ class PayloadAgent:
                 "status_code": webscan.get("status_code") or target_probe.get("status_code"),
                 "title": webscan.get("title"),
                 "total_findings": len(findings),
+                "raw_total_findings": len(raw_findings),
+                "report_confirmed_only": report_confirmed_only,
                 "risk_level": self._risk_level(findings),
                 "auth_required": bool(target_probe.get("auth_required")),
                 "auth_type_guess": target_probe.get("auth_type_guess", "none"),
-                "confirmed": len([item for item in findings if item.get("status") == "确认漏洞"]),
-                "suspected": len([item for item in findings if item.get("status") == "疑似漏洞"]),
+                "confirmed": len([item for item in raw_findings if item.get("status") == "确认漏洞"]),
+                "suspected": len([item for item in raw_findings if item.get("status") == "疑似漏洞"]),
                 "llm_payload_allowed": len([item for item in llm_advice if item.get("allowed")]),
                 "llm_payload_blocked": len([item for item in llm_advice if not item.get("allowed")]),
             },
@@ -70,6 +83,12 @@ class PayloadAgent:
     def _severity_score(self, severity: str) -> int:
         return {"Critical": 4, "High": 3, "Medium": 2, "Low": 1, "Info": 0}.get(severity, 0)
 
+    def _env_bool(self, name: str, default: bool) -> bool:
+        value = os.getenv(name)
+        if value is None:
+            return default
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
     def _risk_level(self, findings: list[dict]) -> str:
         if any(item.get("severity") == "Critical" for item in findings):
             return "Critical"
@@ -94,9 +113,10 @@ class PayloadAgent:
             f"- 页面标题：{summary.get('title') or 'N/A'}",
             f"- 状态码：{summary.get('status_code') or 'N/A'}",
             f"- 风险等级：{summary['risk_level']}",
-            f"- 发现数量：{summary['total_findings']}",
+            f"- 展示发现数量：{summary['total_findings']}",
             f"- 确认漏洞：{summary.get('confirmed', 0)}",
             f"- 疑似漏洞：{summary.get('suspected', 0)}",
+            f"- 报告过滤：{'仅展示确认漏洞' if summary.get('report_confirmed_only') else '展示全部发现'}",
             "",
             "## 目标探测结果",
             "",
@@ -254,6 +274,22 @@ class PayloadAgent:
                     f"{name}: status={item.get('status_code')}, length={item.get('body_length')}, {item.get('matched', '')}".strip()
                 )
             return " | ".join(parts)
+        if "error_probe" in evidence or "followup" in evidence:
+            parts = []
+            error_probe = evidence.get("error_probe", {})
+            if error_probe:
+                parts.append(
+                    f"error_probe: status={error_probe.get('status_code')}, length={error_probe.get('body_length')}, {error_probe.get('matched', '')}".strip()
+                )
+            followup = evidence.get("followup", {})
+            if followup:
+                if followup.get("column_count"):
+                    parts.append(f"column_count={followup.get('column_count')}")
+                union_probe = followup.get("union_probe", {})
+                if union_probe:
+                    markers = ", ".join(union_probe.get("reflected_markers", [])) or "none"
+                    parts.append(f"union_reflected={markers}")
+            return " | ".join(parts) if parts else "N/A"
         return (
             f"status={evidence.get('status_code', 'N/A')}, "
             f"length={evidence.get('body_length', 'N/A')}, "

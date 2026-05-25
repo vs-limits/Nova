@@ -87,6 +87,7 @@ def settings_from_args(args: argparse.Namespace) -> RuntimeSettings:
         llm_payload_advisor=settings.llm_payload_advisor,
         llm_payload_max_per_param=settings.llm_payload_max_per_param,
         llm_payload_report_only=settings.llm_payload_report_only,
+        report_confirmed_only=settings.report_confirmed_only,
         allowed_hosts=settings.allowed_hosts,
         exclude_paths=settings.exclude_paths,
         auth_headers=auth_headers,

