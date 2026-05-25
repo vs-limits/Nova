@@ -1,0 +1,43 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test and coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# NOVA runtime artifacts
+.Nova/
+reports/
+*.log
+
+# Local secrets and authentication material
+.env
+*.env
+backend/helper/config/.env
+auth_headers.json
+*_auth_headers.json
+*.token
+*.secret
+
+# Editor and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Packaging/build outputs
+build/
+dist/
+*.egg-info/
