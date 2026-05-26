@@ -81,6 +81,7 @@ def settings_from_args(args: argparse.Namespace) -> RuntimeSettings:
         active_scan=settings.active_scan,
         active_request_timeout=settings.active_request_timeout,
         max_active_inputs=settings.max_active_inputs,
+        focus_target_path=settings.focus_target_path,
         llm_analysis=settings.llm_analysis,
         llm_on_local_targets=settings.llm_on_local_targets,
         llm_payload_advisor=settings.llm_payload_advisor,

@@ -20,6 +20,10 @@ ADVISORY_CATEGORIES = {
     "sql_progression": "sqli_progression",
     "sqli_progression": "sqli_progression",
     "confirmed_sqli": "sqli",
+    "dom_xss": "dom_xss",
+    "dom xss": "dom_xss",
+    "dom-based xss": "dom_xss",
+    "dom based xss": "dom_xss",
     "blind_sqli": "sqli_blind",
     "sqli_blind": "sqli_blind",
     "blind sql injection": "sqli_blind",
@@ -90,6 +94,8 @@ class PayloadSafetyFilter:
         if any(token in payload_lower for token in ("1=1", "1=2", " or ", " and ")):
             return "sqli_blind" if "1=2" in payload_lower else "sqli"
         if "<script" in payload_lower or "onerror=" in payload_lower or "svg/onload" in payload_lower:
+            if lowered in {"dom_xss", "dom xss", "dom-based xss", "dom based xss"}:
+                return "dom_xss"
             return "xss"
         if "../" in payload_lower or "..%2f" in payload_lower:
             return "traversal"

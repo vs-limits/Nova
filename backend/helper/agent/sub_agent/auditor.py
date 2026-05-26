@@ -251,6 +251,21 @@ class AuditorAgent:
 
                 context_params = input_point.get("form_defaults", {})
                 self._last_probe_failed = False
+                dom_xss = self._detect_dom_xss(page, input_point, len(findings) + 1)
+                if dom_xss:
+                    findings.append(dom_xss)
+                    continue
+
+                if self._prefer_xss_checks(page, input_point):
+                    reflection = (
+                        self._probe_reflection(url, name, context_params, len(findings) + 1)
+                        if self.settings.active_scan
+                        else None
+                    )
+                    if reflection:
+                        findings.append(reflection)
+                        continue
+
                 sqli_finding = (
                     self._probe_sqli(url, name, context_params, len(findings) + 1)
                     if self.settings.active_scan
@@ -275,14 +290,15 @@ class AuditorAgent:
                     )
                     continue
 
-                reflection = (
-                    self._probe_reflection(url, name, context_params, len(findings) + 1)
-                    if self.settings.active_scan
-                    else None
-                )
-                if reflection:
-                    findings.append(reflection)
-                    continue
+                if not self._prefer_xss_checks(page, input_point):
+                    reflection = (
+                        self._probe_reflection(url, name, context_params, len(findings) + 1)
+                        if self.settings.active_scan
+                        else None
+                    )
+                    if reflection:
+                        findings.append(reflection)
+                        continue
 
                 findings.append(
                     self._finding(
@@ -298,6 +314,68 @@ class AuditorAgent:
                     )
                 )
         return findings
+
+    def _detect_dom_xss(self, page: dict, input_point: dict, finding_index: int) -> dict | None:
+        if input_point.get("method", "GET").upper() != "GET":
+            return None
+        name = str(input_point.get("name") or "")
+        if not name:
+            return None
+        url = str(input_point.get("url") or page.get("final_url") or page.get("url") or "")
+        html = str(page.get("html_sample") or page.get("response_summary") or "")
+        lowered_context = " ".join(
+            [
+                urlparse(url).path.lower(),
+                str(page.get("title") or "").lower(),
+                html.lower(),
+            ]
+        )
+        if not self._looks_like_dom_xss_context(lowered_context):
+            return None
+        if name.lower() not in lowered_context:
+            return None
+        if not self._has_dom_source_to_sink(lowered_context):
+            return None
+
+        payload = f"English<script>alert('NOVA_DOM_XSS')</script>"
+        return self._finding(
+            self._new_id("DOMXSS", finding_index),
+            "确认存在 DOM 型 XSS source-to-sink 风险",
+            "High",
+            "High",
+            "dom_xss",
+            url,
+            f"页面脚本从 URL 参数 {name} 读取数据，并写入 document.write/HTML sink；该模式可触发 DOM 型 XSS。",
+            payloads=[payload],
+            status=STATUS_CONFIRMED,
+            request_response={
+                "matched": "DOM source-to-sink",
+                "source": "document.location/location.href",
+                "sink": "document.write/HTML sink",
+                "parameter": name,
+            },
+            details={
+                "verification_method": "static_dom_source_sink",
+                "source": "URL/location",
+                "sink": "document.write/HTML sink",
+                "target_param": name,
+                "candidate_payload": payload,
+                "note": "NOVA 未执行浏览器 JavaScript；该结论来自页面脚本中的 DOM source-to-sink 静态证据，适用于 DVWA xss_d 这类 DOM XSS 页面。",
+            },
+        )
+
+    def _prefer_xss_checks(self, page: dict, input_point: dict) -> bool:
+        url = str(input_point.get("url") or page.get("final_url") or page.get("url") or "")
+        lowered = " ".join([urlparse(url).path.lower(), str(page.get("title") or "").lower(), str(input_point.get("name") or "").lower()])
+        return any(token in lowered for token in ("xss", "script", "message", "comment", "search", "keyword", "default"))
+
+    def _looks_like_dom_xss_context(self, lowered_context: str) -> bool:
+        return any(token in lowered_context for token in ("xss_d", "dom based cross site scripting", "dom-based xss", "xss (dom)"))
+
+    def _has_dom_source_to_sink(self, lowered_context: str) -> bool:
+        sources = ("document.location", "location.href", "window.location", "document.url")
+        sinks = ("document.write", "innerhtml", "outerhtml", "insertadjacenthtml")
+        return any(source in lowered_context for source in sources) and any(sink in lowered_context for sink in sinks)
 
     def _probe_sqli(self, url: str, param: str, context_params: dict, finding_index: int) -> dict | None:
         self._last_probe_failed = False
@@ -690,6 +768,7 @@ class AuditorAgent:
             "csrf": "为状态变更请求增加 CSRF Token，并在服务端校验。",
             "injection": "对所有用户可控输入做白名单校验，并使用参数化查询或安全 API。",
             "sqli": "使用参数化查询或 ORM 安全绑定，禁止拼接 SQL，并统一处理数据库错误回显。",
+            "dom_xss": "避免把 URL、location、hash 等 DOM source 直接写入 document.write/innerHTML 等 HTML sink；对输出做上下文编码或使用安全 DOM API。",
             "xss": "对输出内容进行上下文相关编码，并校验所有反射输入点。",
             "traversal": "规范化路径并拒绝目录穿越相关输入模式。",
             "availability": "检查目标可达性、DNS、TLS 和网络连通性配置。",

@@ -238,6 +238,16 @@ class PayloadAgent:
             parts.append(f"推荐模式={details.get('payload_pattern')}")
         if details.get("techniques"):
             parts.append(f"验证技术={', '.join(details.get('techniques', []))}")
+        if details.get("verification_method"):
+            parts.append(f"验证方式={details.get('verification_method')}")
+        if details.get("source"):
+            parts.append(f"DOM source={details.get('source')}")
+        if details.get("sink"):
+            parts.append(f"DOM sink={details.get('sink')}")
+        if details.get("target_param"):
+            parts.append(f"参数={details.get('target_param')}")
+        if details.get("candidate_payload"):
+            parts.append(f"候选 payload={details.get('candidate_payload')}")
         return "；".join(parts) if parts else "N/A"
 
     def _candidate_payload_section(self, report: dict) -> list[str]:

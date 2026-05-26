@@ -149,6 +149,17 @@ class WebScannerAgent:
                 errors.append({"url": url, "error": page.get("error", "请求失败")})
                 continue
 
+            if self.settings.focus_target_path and not self._active_path_allowed(target_url, page.get("final_url") or url):
+                self._deactivate_page_inputs(page, "outside_target_path")
+                events.append(
+                    {
+                        "url": page.get("final_url") or url,
+                        "depth": depth,
+                        "event": "active_inputs_disabled",
+                        "reason": "outside_target_path",
+                    }
+                )
+
             pages.append(page)
             for link in page.get("links", [])[: self.settings.max_links]:
                 normalized_link = self._normalize_for_seen(link)
@@ -196,6 +207,7 @@ class WebScannerAgent:
                 "主动验证仅限 GET 参数和 GET 表单",
                 "默认排除 logout、delete、remove 等危险路径",
                 "爬取去重按路径和参数名处理，避免反射页面因参数值变化反复入队",
+                "默认只对目标 URL 所在路径内的输入点做主动验证，导航到其它模块的页面只记录不主动测试",
             ],
         }
 
@@ -267,6 +279,22 @@ class WebScannerAgent:
                     }
                 )
         return points
+
+    def _active_path_allowed(self, target_url: str, candidate_url: str) -> bool:
+        target = urlparse(target_url)
+        candidate = urlparse(candidate_url)
+        target_path = target.path or "/"
+        candidate_path = candidate.path or "/"
+        if target_path == "/":
+            return True
+        normalized_target = target_path.rstrip("/")
+        return candidate_path == normalized_target or candidate_path.startswith(f"{normalized_target}/")
+
+    def _deactivate_page_inputs(self, page: dict, reason: str) -> None:
+        for point in page.get("input_points", []):
+            if point.get("active_testable"):
+                point["active_testable"] = False
+                point["active_scope_reason"] = reason
 
     def _extract_query_input_points(self, url: str) -> list[dict]:
         parsed = urlparse(url)

@@ -61,6 +61,7 @@ class RuntimeSettings:
     active_scan: bool = True
     active_request_timeout: float = 3.0
     max_active_inputs: int = 5
+    focus_target_path: bool = True
     llm_analysis: bool = True
     llm_on_local_targets: bool = True
     llm_payload_advisor: bool = True
@@ -104,6 +105,7 @@ def load_runtime_settings() -> RuntimeSettings:
         active_scan=_env_bool("NOVA_ACTIVE_SCAN", True),
         active_request_timeout=_env_float("NOVA_ACTIVE_REQUEST_TIMEOUT", 3.0),
         max_active_inputs=_env_int("NOVA_MAX_ACTIVE_INPUTS", 5),
+        focus_target_path=_env_bool("NOVA_FOCUS_TARGET_PATH", True),
         llm_analysis=_env_bool("NOVA_LLM_ANALYSIS", True),
         llm_on_local_targets=_env_bool("NOVA_LLM_ON_LOCAL_TARGETS", True),
         llm_payload_advisor=_env_bool("NOVA_LLM_PAYLOAD_ADVISOR", True),

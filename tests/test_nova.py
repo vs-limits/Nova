@@ -27,6 +27,7 @@ def settings(**overrides) -> RuntimeSettings:
         "active_scan": False,
         "active_request_timeout": 1,
         "max_active_inputs": 5,
+        "focus_target_path": True,
         "llm_analysis": True,
         "llm_on_local_targets": True,
         "llm_payload_advisor": True,
@@ -156,6 +157,62 @@ def test_scanner_fetch_extracts_get_form_inputs_and_auth(monkeypatch) -> None:
     assert points["Submit"]["active_testable"] is False
     assert seen_headers["Cookie"] == "sid=secret"
     assert result["auth"]["redacted_headers"]["Cookie"] != "sid=secret"
+
+
+def test_scanner_focuses_active_inputs_on_target_path(monkeypatch) -> None:
+    pages = {
+        "http://example.com/DVWA/vulnerabilities/xss_d/?default=English": """
+        <html><head><title>XSS DOM</title></head><body>
+          <a href="/DVWA/vulnerabilities/brute/">Brute</a>
+          <form method="get"><select name="default"></select></form>
+        </body></html>
+        """,
+        "http://example.com/DVWA/vulnerabilities/brute/": """
+        <html><head><title>Brute Force</title></head><body>
+          <form method="get">
+            <input name="username" type="text">
+            <input name="password" type="password">
+          </form>
+        </body></html>
+        """,
+    }
+
+    class Headers(dict):
+        def get_content_charset(self):
+            return "utf-8"
+
+        def get_all(self, name, _default=None):
+            return []
+
+        def items(self):
+            return super().items()
+
+    class Response:
+        status = 200
+        headers = Headers({"Content-Type": "text/html"})
+
+        def __init__(self, url: str) -> None:
+            self.url = url
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, *_):
+            return pages[self.url].encode("utf-8")
+
+    monkeypatch.setattr("backend.helper.agent.sub_agent.scanner.urlopen", lambda request, **_kwargs: Response(request.full_url))
+
+    result = WebScannerAgent(settings(max_depth=1, max_pages=3)).scan(
+        "http://example.com/DVWA/vulnerabilities/xss_d/?default=English"
+    )
+
+    points = {item["name"]: item for item in result["input_points"]}
+    assert points["default"]["active_testable"] is True
+    assert points["username"]["active_testable"] is False
+    assert points["username"]["active_scope_reason"] == "outside_target_path"
 
 
 def test_scanner_dedupes_reflected_query_links_to_avoid_crawl_loop(monkeypatch) -> None:
@@ -500,6 +557,57 @@ def test_auditor_limits_active_input_points(monkeypatch) -> None:
     audit = AuditorAgent(settings(active_scan=True, max_active_inputs=1)).audit(webscan)
 
     assert any(item["title"] == "主动探测输入点数量达到上限" for item in audit["findings"])
+
+
+def test_auditor_classifies_dvwa_dom_xss_without_sql_probe(monkeypatch) -> None:
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("DOM XSS static source-to-sink detection should not need SQL probes")
+
+    monkeypatch.setattr("backend.helper.agent.sub_agent.auditor.urlopen", fail_if_called)
+    html = """
+    <title>Vulnerability: DOM Based Cross Site Scripting (XSS)</title>
+    <script>
+      if (document.location.href.indexOf("default=") >= 0) {
+        var lang = document.location.href.substring(document.location.href.indexOf("default=")+8);
+        document.write("<option value='" + lang + "'>" + decodeURI(lang) + "</option>");
+      }
+    </script>
+    """
+    webscan = {
+        "target": "http://127.0.0.1/DVWA/vulnerabilities/xss_d/?default=English",
+        "reachable": True,
+        "headers": {
+            "Content-Security-Policy": "default-src 'self'",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+        "cookies": [],
+        "forms": [],
+        "pages": [
+            {
+                "final_url": "http://127.0.0.1/DVWA/vulnerabilities/xss_d/?default=English",
+                "title": "Vulnerability: DOM Based Cross Site Scripting (XSS)",
+                "html_sample": html,
+                "input_points": [
+                    {
+                        "name": "default",
+                        "method": "GET",
+                        "url": "http://127.0.0.1/DVWA/vulnerabilities/xss_d/?default=English",
+                        "active_testable": True,
+                    }
+                ],
+            }
+        ],
+    }
+
+    audit = AuditorAgent(settings(active_scan=True)).audit(webscan)
+
+    confirmed = [item for item in audit["findings"] if item["status"] == "确认漏洞"]
+    assert len(confirmed) == 1
+    assert confirmed[0]["category"] == "dom_xss"
+    assert confirmed[0]["category_label"] == "DOM 型跨站脚本 XSS"
+    assert audit["summary"]["confirmed"] == 1
 
 
 def test_auditor_rules_detect_headers_cookies_forms_and_query() -> None:

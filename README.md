@@ -141,6 +141,7 @@ false: 1' AND '1'='2' #
 | `NOVA_ACTIVE_SCAN` | `true` | 是否启用安全 GET 参数探测 |
 | `NOVA_ACTIVE_REQUEST_TIMEOUT` | `3.0` | 主动探测单个 payload 请求超时，单位秒 |
 | `NOVA_MAX_ACTIVE_INPUTS` | `5` | 单次扫描最多主动探测的输入点数量 |
+| `NOVA_FOCUS_TARGET_PATH` | `true` | 是否只对目标 URL 所在路径内的输入点做主动验证；可避免 DVWA 菜单页串扫到其它漏洞模块 |
 | `NOVA_ALLOWED_HOSTS` | 空 | 额外允许扫描的主机列表，英文逗号分隔 |
 | `NOVA_EXCLUDE_PATHS` | 空 | 排除路径前缀，英文逗号分隔 |
 | `NOVA_AUTH_HEADERS_FILE` | 空 | 认证 Header JSON 文件 |
@@ -176,6 +177,10 @@ python main.py --url http://127.0.0.1/DVWA/vulnerabilities/xss_r/ --cookie "PHPS
 ```
 
 如果登录态有效，NOVA 会识别 DVWA 页面中的 GET 表单参数，并尝试用本地规则验证 SQLi 或 XSS 反射风险。候选 payload 会写入报告，但不会自动执行。
+
+扫描 DVWA 单个漏洞页面时，默认 `NOVA_FOCUS_TARGET_PATH=true`，所以例如扫描 `/vulnerabilities/xss_d/` 时，NOVA 不会主动测试左侧菜单里的 `/brute/`、`/sqli/` 等其它模块，避免报告被其它靶场漏洞“抢占”。如果你确实要做同源多页面扫描，可以设置 `NOVA_FOCUS_TARGET_PATH=false`。
+
+DOM XSS 页面不会通过普通 HTTP 客户端执行 JavaScript。NOVA 对 `/xss_d/` 这类页面使用轻量 source-to-sink 静态规则：当 URL 参数进入 `document.location/location.href` 并写入 `document.write/innerHTML` 等 sink 时，报告为“DOM 型跨站脚本 XSS”。
 
 本地靶场如果响应较慢或某些 payload 触发长时间等待，可以收紧主动探测预算：
 
