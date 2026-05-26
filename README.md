@@ -180,6 +180,8 @@ python main.py --url http://127.0.0.1/DVWA/vulnerabilities/xss_r/ --cookie "PHPS
 
 扫描 DVWA 单个漏洞页面时，默认 `NOVA_FOCUS_TARGET_PATH=true`，所以例如扫描 `/vulnerabilities/xss_d/` 时，NOVA 不会主动测试左侧菜单里的 `/brute/`、`/sqli/` 等其它模块，避免报告被其它靶场漏洞“抢占”。如果你确实要做同源多页面扫描，可以设置 `NOVA_FOCUS_TARGET_PATH=false`。
 
+反射型 XSS 页面会使用非破坏性 GET payload 做主动验证。如果 `<script>alert('NOVA_XSS')</script>` 或属性逃逸类 payload 以未编码形式回显，NOVA 会把该输入点报告为“确认存在反射型 XSS”；如果只是普通文本反射或上下文无法判断，则只保留为疑似风险。
+
 DOM XSS 页面不会通过普通 HTTP 客户端执行 JavaScript。NOVA 对 `/xss_d/` 这类页面使用轻量 source-to-sink 静态规则：当 URL 参数进入 `document.location/location.href` 并写入 `document.write/innerHTML` 等 sink 时，报告为“DOM 型跨站脚本 XSS”。
 
 本地靶场如果响应较慢或某些 payload 触发长时间等待，可以收紧主动探测预算：

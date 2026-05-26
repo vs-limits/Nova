@@ -236,6 +236,12 @@ class PayloadAgent:
             parts.append(f"注释后缀={details.get('comment_suffix')}")
         if details.get("payload_pattern"):
             parts.append(f"推荐模式={details.get('payload_pattern')}")
+        if details.get("xss_type"):
+            parts.append(f"XSS 类型={details.get('xss_type')}")
+        if details.get("reflection_context"):
+            parts.append(f"反射上下文={details.get('reflection_context')}")
+        if details.get("confirmation_basis"):
+            parts.append(f"确认依据={details.get('confirmation_basis')}")
         if details.get("techniques"):
             parts.append(f"验证技术={', '.join(details.get('techniques', []))}")
         if details.get("verification_method"):

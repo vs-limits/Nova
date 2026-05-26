@@ -558,25 +558,71 @@ class AuditorAgent:
         return f"-1' UNION SELECT {','.join(columns)} {SQL_COMMENT_SUFFIX}"
 
     def _probe_reflection(self, url: str, param: str, context_params: dict, finding_index: int) -> dict | None:
-        payloads = [("xss", "<script>alert(1)</script>")]
-        for category, payload in payloads:
+        payloads = [
+            ("xss", "<script>alert('NOVA_XSS')</script>", "script 标签反射"),
+            ("xss", "\"><svg/onload=alert('NOVA_XSS')>", "HTML 属性逃逸反射"),
+        ]
+        suspected: dict | None = None
+        for category, payload, purpose in payloads:
             response = self._http_get(self._mutate_url(url, param, payload, context_params))
             if not response:
                 continue
             if payload in response["body"]:
-                return self._finding(
+                context = self._reflection_context(response["body"], payload)
+                confirmed = self._is_executable_xss_reflection(response["body"], payload)
+                finding = self._finding(
                     self._new_id("P", finding_index),
-                    f"疑似 {category.upper()} 反射点",
-                    "Medium",
-                    "Medium",
+                    "确认存在反射型 XSS" if confirmed else f"疑似 {category.upper()} 反射点",
+                    "High" if confirmed else "Medium",
+                    "High" if confirmed else "Medium",
                     category,
                     response["url"],
-                    f"参数 {param} 的测试 payload 在响应中被原样反射，状态码为 {response['status_code']}。",
+                    (
+                        f"参数 {param} 的 XSS payload 在响应中以未编码形式回显，状态码为 {response['status_code']}。"
+                        if confirmed
+                        else f"参数 {param} 的测试 payload 在响应中被原样反射，状态码为 {response['status_code']}。"
+                    ),
                     payloads=[payload],
-                    status=STATUS_SUSPECTED,
+                    status=STATUS_CONFIRMED if confirmed else STATUS_SUSPECTED,
                     request_response=self._evidence_block(response, matched=payload),
+                    details={
+                        "xss_type": "reflected",
+                        "target_param": param,
+                        "reflection_context": context,
+                        "payload_pattern": purpose,
+                        "confirmation_basis": (
+                            "未编码的可执行 XSS payload 在响应中原样回显"
+                            if confirmed
+                            else "payload 原样回显，但需要人工确认浏览器执行上下文"
+                        ),
+                    },
                 )
-        return None
+                if confirmed:
+                    return finding
+                suspected = suspected or finding
+        return suspected
+
+    def _is_executable_xss_reflection(self, body: str, payload: str) -> bool:
+        if payload not in body:
+            return False
+        lowered = payload.lower()
+        executable_markers = ("<script", "</script>", "<svg", "onload=", "onerror=", "javascript:")
+        if not any(marker in lowered for marker in executable_markers):
+            return False
+        return True
+
+    def _reflection_context(self, body: str, payload: str) -> str:
+        index = body.find(payload)
+        if index < 0:
+            return "未定位"
+        last_lt = body.rfind("<", 0, index)
+        last_gt = body.rfind(">", 0, index)
+        if last_lt > last_gt:
+            return "HTML 标签属性上下文"
+        lowered_window = body[max(0, index - 80) : index + len(payload) + 80].lower()
+        if "<script" in lowered_window:
+            return "脚本标签上下文"
+        return "HTML 正文上下文"
 
     def _http_get(self, url: str) -> dict | None:
         try:

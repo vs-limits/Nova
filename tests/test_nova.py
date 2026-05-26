@@ -409,6 +409,71 @@ def test_auditor_error_sqli_runs_order_by_and_union_followup(monkeypatch) -> Non
     assert finding["details"]["visible_columns"] == [2, 3]
 
 
+def test_auditor_confirms_reflected_xss_when_payload_is_raw(monkeypatch) -> None:
+    class Headers(dict):
+        def get_content_charset(self):
+            return "utf-8"
+
+    class Response:
+        def __init__(self, url: str, body: str) -> None:
+            self.url = url
+            self.status = 200
+            self.headers = Headers({"Content-Type": "text/html"})
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, *_):
+            return self.body.encode("utf-8")
+
+    def fake_urlopen(request, **_kwargs):
+        url = request.full_url
+        value = parse_qs(urlparse(url).query).get("name", [""])[0]
+        return Response(url, f"<html><body>Hello {value}</body></html>")
+
+    monkeypatch.setattr("backend.helper.agent.sub_agent.auditor.urlopen", fake_urlopen)
+    webscan = {
+        "target": "http://127.0.0.1/DVWA/vulnerabilities/xss_r/?name=hyx",
+        "reachable": True,
+        "headers": {
+            "Content-Security-Policy": "default-src 'self'",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+        "cookies": [],
+        "forms": [],
+        "pages": [
+            {
+                "title": "Vulnerability: Reflected Cross Site Scripting (XSS)",
+                "input_points": [
+                    {
+                        "name": "name",
+                        "method": "GET",
+                        "url": "http://127.0.0.1/DVWA/vulnerabilities/xss_r/?name=hyx",
+                        "active_testable": True,
+                    }
+                ],
+            }
+        ],
+    }
+
+    audit = AuditorAgent(settings(active_scan=True, llm_payload_advisor=False)).audit(webscan)
+
+    confirmed = [item for item in audit["findings"] if item["status"] == "确认漏洞"]
+    assert len(confirmed) == 1
+    assert confirmed[0]["title"] == "确认存在反射型 XSS"
+    assert confirmed[0]["category"] == "xss"
+    assert confirmed[0]["details"]["xss_type"] == "reflected"
+    assert confirmed[0]["details"]["target_param"] == "name"
+    assert "<script>alert('NOVA_XSS')</script>" in confirmed[0]["payloads"]
+    assert audit["summary"]["confirmed"] == 1
+
+
 def test_auditor_detects_boolean_sqli(monkeypatch) -> None:
     class Headers(dict):
         def get_content_charset(self):
