@@ -9,8 +9,12 @@ NOVA 是一个轻量级、AI 辅助的 Web 安全审计 CLI。当前版本采用
 - 目标探测：DNS、TLS、HTTP 状态码、最终 URL、跳转链、认证需求和登录页信号。
 - 受控爬取：默认只扫描同源 URL，限制深度、页面数、速率和危险路径。
 - 输入点识别：提取链接、表单、GET 参数、Cookie、响应头、页面标题和响应摘要。
-- 本地审计：检测安全响应头缺失、信息泄露、Cookie 属性缺失、CSRF Token 缺失、GET 参数注入风险。
-- 安全主动验证：仅对 GET 参数做轻量 SQLi 错误回显、布尔型 SQLi 和 XSS 反射验证。
+- 本地审计：规则位于 `backend/helper/vuln_rules/`，证据构造位于 `backend/helper/evidence/`，便于继续扩展漏洞类型。
+- 安全主动验证：仅对 GET 参数做轻量 SQLi、SQL 盲注、XSS、LFI/目录穿越和命令注入 echo 标记验证；对 DVWA `weak_id` 这类明确的 Generate 表单，会执行受限的同页空/Generate POST 来读取 `Set-Cookie` 证据。
+- 信息泄露与配置：检测安全响应头缺失、Cookie 属性缺失、CSRF Token 缺失、Server/X-Powered-By、错误栈、调试页和绝对路径泄露。
+- CSRF 识别：POST 状态变更表单缺 Token 记为疑似；GET 改密码/保存/更新类表单缺 Token 记为确认风险，适配 DVWA CSRF 页面。
+- 扩展规则：默认检测开放重定向、CSP 弱配置、JavaScript 暴露、弱会话标识和被动密码学弱点。
+- 高风险候选：SSRF、存储型 XSS、文件上传默认只做候选/疑似；显式开启后才做 callback、表单提交或 harmless 文件上传验证。
 - 候选 payload：LLM 和本地上下文模板可生成建议 payload，但必须经过本地 Safety Filter，且只写入报告。
 - 中文报告：生成 `reports/scan_report.md` 和 `reports/scan_report.json`。
 
@@ -95,7 +99,7 @@ NOVA 支持两类候选 payload 来源：
 
 候选 payload 第一版仅写入报告，不自动执行，也不参与漏洞确认。所有候选必须经过本地 Safety Filter。
 
-报告和 JSON 会同时保留机器可读的 `category` 以及中文 `category_label` / `category_group`，例如 `sqli` 会显示为“SQL 注入（错误回显/UNION）”，`sqli_blind` 会显示为“SQL 盲注（布尔型）”。Markdown 报告会先给出“漏洞类型汇总”，再按类型分组展示发现项。
+报告和 JSON 会同时保留机器可读的 `category` 以及中文 `category_label` / `category_group`，例如 `sqli` 会显示为“SQL 注入（错误回显/UNION）”，`sqli_blind` 会显示为“SQL 盲注（布尔型）”。Markdown 报告会先给出“漏洞类型汇总”，再按类型分组展示发现项；默认展示确认漏洞和可验证候选，隐藏普通配置建议和扫描提示。
 
 Safety Filter 会阻止危险 payload，例如：
 
@@ -121,8 +125,10 @@ false: 1' AND '1'='2' #
 - 默认只扫描用户提供 URL 的同源范围：协议、主机和端口必须一致。
 - TargetProbe 如果发现最终跳转到不同 host，默认停止扫描；只有该 host 出现在 `NOVA_ALLOWED_HOSTS` 时才继续。
 - 默认不做子域名爆破、不爆破、不上传文件、不做目录大字典扫描。
-- 默认不提交 POST/PUT/PATCH/DELETE 表单。
-- 主动验证仅限已有 GET 参数和 GET 表单。
+- 默认不提交未知 POST/PUT/PATCH/DELETE 业务表单。
+- 主动验证主要限于已有 GET 参数和 GET 表单；例外是 DVWA `weak_id` 的 Generate 表单，NOVA 只提交同页空/Generate 请求并读取响应 Cookie，不提交业务字段。
+- 命令注入默认只执行短 `echo NOVA_CMD` 标记探测；可通过 `NOVA_COMMAND_INJECTION_PROBES=false` 关闭。
+- SSRF、存储型 XSS、文件上传默认不触发服务端外连、POST 提交或文件上传。
 - 默认排除 `/logout`、`/signout`、`/delete`、`/remove` 等危险路径。
 - 爬取去重按路径和参数名处理，不把反射参数值变化当成无限新页面，避免 XSS 反射页面反复入队。
 - 所有漏洞确认必须有本地请求/响应证据；LLM 只能提供解释、修复建议和候选 payload。
@@ -141,6 +147,13 @@ false: 1' AND '1'='2' #
 | `NOVA_ACTIVE_SCAN` | `true` | 是否启用安全 GET 参数探测 |
 | `NOVA_ACTIVE_REQUEST_TIMEOUT` | `3.0` | 主动探测单个 payload 请求超时，单位秒 |
 | `NOVA_MAX_ACTIVE_INPUTS` | `5` | 单次扫描最多主动探测的输入点数量 |
+| `NOVA_COMMAND_INJECTION_PROBES` | `true` | 是否启用非破坏性命令注入 echo 标记探测 |
+| `NOVA_OPEN_REDIRECT_PROBES` | `true` | 是否启用开放重定向 GET 参数探测 |
+| `NOVA_FETCH_SAME_ORIGIN_SCRIPTS` | `true` | 是否抓取同源 JavaScript 用于静态分析 |
+| `NOVA_MAX_SCRIPT_BYTES` | `200000` | 单个 JS 文件最多读取字节数 |
+| `NOVA_SSRF_CALLBACK_URL` | 空 | SSRF callback 验证 URL；为空时只生成候选/疑似 |
+| `NOVA_STORED_XSS_PROBES` | `false` | 是否允许提交带 nonce 的存储型 XSS 测试表单 |
+| `NOVA_FILE_UPLOAD_PROBES` | `false` | 是否允许上传 harmless 文本文件做文件上传验证 |
 | `NOVA_FOCUS_TARGET_PATH` | `true` | 是否只对目标 URL 所在路径内的输入点做主动验证；可避免 DVWA 菜单页串扫到其它漏洞模块 |
 | `NOVA_ALLOWED_HOSTS` | 空 | 额外允许扫描的主机列表，英文逗号分隔 |
 | `NOVA_EXCLUDE_PATHS` | 空 | 排除路径前缀，英文逗号分隔 |
@@ -152,7 +165,8 @@ false: 1' AND '1'='2' #
 | `NOVA_LLM_PAYLOAD_ADVISOR` | `true` | 是否启用候选 payload 生成 |
 | `NOVA_LLM_PAYLOAD_MAX_PER_PARAM` | `5` | 每个参数最多保留的候选数量 |
 | `NOVA_LLM_PAYLOAD_REPORT_ONLY` | `true` | 候选 payload 是否仅报告。第一版按仅报告处理 |
-| `NOVA_REPORT_CONFIRMED_ONLY` | `true` | 报告是否只展示确认漏洞，默认隐藏配置建议、信息提示和待验证项 |
+| `NOVA_REPORT_CONFIRMED_ONLY` | `true` | 报告是否过滤普通非确认项 |
+| `NOVA_REPORT_VERIFIABLE_CANDIDATES` | `true` | 在过滤模式下是否仍展示 SSRF、存储型 XSS、文件上传等可验证候选 |
 
 ## 输出文件
 
@@ -174,15 +188,35 @@ false: 1' AND '1'='2' #
 python main.py --url http://127.0.0.1/DVWA/vulnerabilities/sqli/ --cookie "PHPSESSID=your_value; security=low"
 python main.py --url http://127.0.0.1/DVWA/vulnerabilities/sqli_blind/ --cookie "PHPSESSID=your_value; security=low"
 python main.py --url http://127.0.0.1/DVWA/vulnerabilities/xss_r/ --cookie "PHPSESSID=your_value; security=low"
+python main.py --url http://127.0.0.1/DVWA/vulnerabilities/fi/?page=include.php --cookie "PHPSESSID=your_value; security=low"
+python main.py --url "http://127.0.0.1/DVWA/vulnerabilities/exec/?ip=127.0.0.1&Submit=Submit" --cookie "PHPSESSID=your_value; security=low"
+python main.py --url http://127.0.0.1/DVWA/vulnerabilities/weak_id/ --cookie "PHPSESSID=your_value; security=low"
+python main.py --url http://127.0.0.1/DVWA/vulnerabilities/javascript/ --cookie "PHPSESSID=your_value; security=low"
+python main.py --url http://127.0.0.1/DVWA/vulnerabilities/open_redirect/ --cookie "PHPSESSID=your_value; security=low"
+python main.py --url http://127.0.0.1/DVWA/vulnerabilities/csp/ --cookie "PHPSESSID=your_value; security=low"
 ```
 
-如果登录态有效，NOVA 会识别 DVWA 页面中的 GET 表单参数，并尝试用本地规则验证 SQLi 或 XSS 反射风险。候选 payload 会写入报告，但不会自动执行。
+如果登录态有效，NOVA 会识别 DVWA 页面中的 GET 表单参数，并尝试用本地规则验证 SQLi、XSS、LFI/目录穿越、命令注入或弱会话 ID 生成风险。候选 payload 会写入报告，但不会自动执行。
 
 扫描 DVWA 单个漏洞页面时，默认 `NOVA_FOCUS_TARGET_PATH=true`，所以例如扫描 `/vulnerabilities/xss_d/` 时，NOVA 不会主动测试左侧菜单里的 `/brute/`、`/sqli/` 等其它模块，避免报告被其它靶场漏洞“抢占”。如果你确实要做同源多页面扫描，可以设置 `NOVA_FOCUS_TARGET_PATH=false`。
 
 反射型 XSS 页面会使用非破坏性 GET payload 做主动验证。如果 `<script>alert('NOVA_XSS')</script>` 或属性逃逸类 payload 以未编码形式回显，NOVA 会把该输入点报告为“确认存在反射型 XSS”；如果只是普通文本反射或上下文无法判断，则只保留为疑似风险。
 
 DOM XSS 页面不会通过普通 HTTP 客户端执行 JavaScript。NOVA 对 `/xss_d/` 这类页面使用轻量 source-to-sink 静态规则：当 URL 参数进入 `document.location/location.href` 并写入 `document.write/innerHTML` 等 sink 时，报告为“DOM 型跨站脚本 XSS”。
+
+LFI/目录穿越只会对 `file/path/page/template/include` 等路径型 GET 参数尝试只读探测，并以 `/etc/passwd` 或 `win.ini` 这类稳定特征作为确认依据。命令注入只会对 `cmd/command/ip/host/ping/target` 等命令型参数发送短 `echo NOVA_CMD` 标记 payload，只有响应中出现唯一标记才确认。
+
+开放重定向会对 `url/next/redirect/return/callback/continue` 等 GET 参数使用 `https://nova.invalid/redirect-check` 做无副作用跳转验证。SSRF 只在配置 `NOVA_SSRF_CALLBACK_URL` 后主动验证；未配置时仅报告候选输入点。存储型 XSS 和文件上传默认也只报告候选表单，避免污染业务数据或留下文件。
+
+DVWA Open Redirect 页面里的漏洞入口是带 `redirect` 参数的链接，不是表单。NOVA 会把同源链接上的查询参数也建模为输入点，并尝试完整 URL、协议相对 URL 等安全外部跳转候选；只有响应 `Location` 离开当前 host 时才确认开放重定向。
+
+DVWA JavaScript 页面属于客户端校验绕过。NOVA 会识别 `phrase/token` 表单，使用本地规则计算 low/medium/high 三类 token 并提交 `phrase=success` 做验证；只有响应出现 `Well done!` 才报告为“确认存在 JavaScript 客户端校验绕过”。
+
+DVWA CSP 页面属于 CSP Bypass challenge。NOVA 会识别 `include` 表单和 CSP 响应头：low 级别验证白名单外部脚本是否能被用户控制为 `script src`，medium 级别验证 nonce 是否可被复用，high 级别验证同源 JSONP callback 是否可控。只有响应中出现对应可执行脚本证据时才报告为确认漏洞。
+
+DVWA CSRF 页面通常是 GET 改密码表单。NOVA 不会提交该表单，但会根据 `password_new/password_conf/Change` 等状态变更字段和缺失 Token 证据，将其报告为“确认存在 GET 状态变更 CSRF 风险”。
+
+确认 CSRF 后，报告的“候选 Payload”章节会额外给出仅供手工验证的 PoC 候选，例如带占位密码的 GET URL 和 `<img src="...">` 触发片段。它们用于说明“浏览器可在受害者登录态下跨站发起状态变更请求”，NOVA 不会自动访问这些 PoC。
 
 本地靶场如果响应较慢或某些 payload 触发长时间等待，可以收紧主动探测预算：
 

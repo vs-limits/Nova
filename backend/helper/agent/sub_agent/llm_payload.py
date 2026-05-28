@@ -6,7 +6,7 @@ import ipaddress
 import json
 import re
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from backend.helper.llm.client import LLMClient
 from backend.helper.settings import RuntimeSettings
@@ -34,6 +34,26 @@ ADVISORY_CATEGORIES = {
     "traversal": "traversal",
     "command injection": "command_injection",
     "command_injection": "command_injection",
+    "csrf": "csrf",
+    "cross site request forgery": "csrf",
+    "cross_site_request_forgery": "csrf",
+    "cross-site request forgery": "csrf",
+    "ssrf": "ssrf",
+    "server side request forgery": "ssrf",
+    "server-side request forgery": "ssrf",
+    "open redirect": "open_redirect",
+    "open_redirect": "open_redirect",
+    "stored xss": "stored_xss",
+    "stored_xss": "stored_xss",
+    "file upload": "file_upload",
+    "file_upload": "file_upload",
+    "weak session": "weak_session",
+    "weak_session": "weak_session",
+    "weak session id": "weak_session",
+    "javascript": "javascript_exposure",
+    "javascript_exposure": "javascript_exposure",
+    "client side validation": "javascript_exposure",
+    "client-side validation": "javascript_exposure",
 }
 
 SQL_COMMENT_SUFFIX = "-- -"
@@ -97,6 +117,8 @@ class PayloadSafetyFilter:
             if lowered in {"dom_xss", "dom xss", "dom-based xss", "dom based xss"}:
                 return "dom_xss"
             return "xss"
+        if lowered == "csrf" or "<form" in payload_lower or ("<img" in payload_lower and "src=" in payload_lower):
+            return "csrf"
         if "../" in payload_lower or "..%2f" in payload_lower:
             return "traversal"
         if "/etc/passwd" in payload_lower or "win.ini" in payload_lower:
@@ -172,12 +194,64 @@ class PayloadSafetyFilter:
         lowered = payload.lower()
         if len(payload) > 300:
             return False, "payload 过长，第一版不进入报告复现步骤"
+        if category == "csrf":
+            return self._is_allowed_csrf(payload)
+        if category == "ssrf":
+            return self._is_allowed_ssrf(payload)
         for pattern, reason in self.DANGEROUS_PATTERNS:
             if re.search(pattern, lowered, re.I):
                 return False, reason
         if category == "unknown":
             return False, "无法归类到允许的非破坏性测试类型"
         return True, "通过本地非破坏性 Safety Filter"
+
+    def _is_allowed_csrf(self, payload: str) -> tuple[bool, str]:
+        lowered = payload.lower()
+        if any(token in lowered for token in ("javascript:", "data:", "file:", "<script", "onerror=", "onload=")):
+            return False, "CSRF 候选包含可执行脚本或危险协议"
+        blocked = (
+            r"\bdrop\b",
+            r"\bdelete\b",
+            r"\binsert\b",
+            r"\balter\b",
+            r"\btruncate\b",
+            r"\binto\s+outfile\b",
+            r"\bload_file\s*\(",
+            r"\bxp_cmdshell\b",
+            r"\bbenchmark\s*\(",
+            r"\bsleep\s*\(",
+            r"\bshutdown\b|\breboot\b",
+            r"\brm\s+-rf\b|\bdel\s+/[sq]\b",
+            r"\bnc\s+-e\b|\bnetcat\b|\breverse\s+shell\b",
+            r"\bbash\s+-i\b|\bpowershell\b|\bcmd\.exe\b",
+            r"\bwget\b|\bcurl\b",
+        )
+        for pattern in blocked:
+            if re.search(pattern, lowered, re.I):
+                return False, "CSRF 候选包含高风险关键字或命令"
+        if not (lowered.startswith(("http://", "https://")) or lowered.startswith("<img ")):
+            return False, "CSRF 候选第一版只允许 http(s) URL 或 img 标签 PoC"
+        return True, "通过本地 CSRF 报告型 Safety Filter；NOVA 不会自动执行"
+
+    def _is_allowed_ssrf(self, payload: str) -> tuple[bool, str]:
+        lowered = payload.lower()
+        parsed = urlparse(payload)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return False, "SSRF 候选第一版只允许 http(s) callback URL"
+        blocked_hosts = {"localhost", "metadata.google.internal"}
+        host = (parsed.hostname or "").lower()
+        if host in blocked_hosts or host.startswith("169.254."):
+            return False, "SSRF 候选指向本地或云元数据地址"
+        try:
+            address = ipaddress.ip_address(host)
+            if address.is_loopback or address.is_private or address.is_link_local:
+                return False, "SSRF 候选指向内网、环回或链路本地地址"
+        except ValueError:
+            pass
+        for pattern, reason in self.DANGEROUS_PATTERNS:
+            if re.search(pattern, lowered, re.I):
+                return False, reason
+        return True, "通过本地 SSRF callback 型 Safety Filter；NOVA 不会自动执行"
 
     def _redact_payload(self, payload: str) -> str:
         compact = re.sub(r"\s+", " ", payload).strip()
@@ -295,6 +369,20 @@ class LLMPayloadAdvisor:
                 candidates.extend(self._sqli_progression_candidates(webscan, finding))
             elif category == "sqli_blind":
                 candidates.extend(self._blind_sqli_progression_candidates(webscan, finding))
+            elif category == "csrf":
+                candidates.extend(self._csrf_progression_candidates(webscan, finding))
+            elif category in {"xss", "dom_xss"}:
+                candidates.extend(self._xss_progression_candidates(webscan, finding))
+            elif category in {"lfi", "traversal"}:
+                candidates.extend(self._lfi_progression_candidates(webscan, finding))
+            elif category == "command_injection":
+                candidates.extend(self._command_progression_candidates(webscan, finding))
+            elif category == "weak_session":
+                candidates.extend(self._weak_session_progression_candidates(webscan, finding))
+            elif category == "open_redirect":
+                candidates.extend(self._open_redirect_progression_candidates(webscan, finding))
+            elif category == "javascript_exposure":
+                candidates.extend(self._javascript_progression_candidates(webscan, finding))
         return candidates
 
     def _sqli_progression_candidates(self, webscan: dict, finding: dict) -> list[dict[str, Any]]:
@@ -380,6 +468,234 @@ class LLMPayloadAdvisor:
                 "expected_false_signal": "false 条件响应应与 true 条件存在稳定差异。",
                 "purpose": "确认布尔型 SQLi 后的只读推进候选：验证 database() 是否可被条件表达式影响",
                 "risk_note": "仅写入报告作为手工参考，不自动请求目标。",
+            }
+        ]
+
+    def _csrf_progression_candidates(self, webscan: dict, finding: dict) -> list[dict[str, Any]]:
+        details = finding.get("details") or {}
+        method = str(details.get("method") or "GET").upper()
+        if method != "GET":
+            return []
+
+        form = self._csrf_form_for_finding(webscan, finding)
+        action_url = str((form or {}).get("action") or finding.get("url") or webscan.get("final_url") or webscan.get("target") or "")
+        if not action_url:
+            return []
+
+        fields = self._csrf_form_fields(form, details)
+        if not fields:
+            return []
+
+        csrf_url = self._csrf_url(action_url, fields)
+        target_param = ",".join(fields)
+        return [
+            {
+                "source": "local_progression_template",
+                "input_point": action_url,
+                "category": "csrf",
+                "target_param": target_param,
+                "payload": csrf_url,
+                "purpose": "确认 GET 状态变更 CSRF 后的手工复现 URL 候选；访问该 URL 可能触发目标状态变更。",
+                "expected_signal": "在已登录受害者会话中打开该 URL 后，目标状态应按参数发生变化，例如 DVWA 密码被改为占位值。",
+                "risk_note": "仅写入报告供授权环境手工验证，NOVA 不会自动请求该 URL；使用前请把占位值改成你的测试值。",
+            },
+            {
+                "source": "local_progression_template",
+                "input_point": action_url,
+                "category": "csrf",
+                "target_param": target_param,
+                "payload": f'<img src="{csrf_url}" style="display:none" alt="">',
+                "purpose": "确认 GET 状态变更 CSRF 后的 HTML PoC 候选；可用于说明跨站页面能诱导浏览器带登录态发起请求。",
+                "expected_signal": "受害者已登录且访问承载该 img 的页面时，浏览器会请求 src 指向的 GET 状态变更 URL。",
+                "risk_note": "仅作为报告型 PoC 候选，不自动执行；请只在 DVWA 或已授权测试环境中手工验证。",
+            },
+        ]
+
+    def _csrf_form_for_finding(self, webscan: dict, finding: dict) -> dict[str, Any] | None:
+        target_url = str(finding.get("url") or "")
+        target = urlparse(target_url)
+        for form in webscan.get("forms", []):
+            if str(form.get("method") or "GET").upper() != "GET":
+                continue
+            action = str(form.get("action") or "")
+            parsed = urlparse(action)
+            if not target_url or (parsed.netloc == target.netloc and parsed.path == target.path):
+                return form
+        return None
+
+    def _csrf_form_fields(self, form: dict[str, Any] | None, details: dict[str, Any]) -> dict[str, str]:
+        fields: dict[str, str] = {}
+        if form:
+            for item in form.get("inputs", []):
+                name = str(item.get("name") or "").strip()
+                if not name:
+                    continue
+                lowered = name.lower()
+                if "csrf" in lowered or "token" in lowered:
+                    continue
+                fields[name] = self._csrf_placeholder(name, str(item.get("type") or ""), str(item.get("value") or ""))
+        if not fields:
+            for name in details.get("input_names", []) or []:
+                normalized = str(name or "").strip()
+                if normalized and "csrf" not in normalized.lower() and "token" not in normalized.lower():
+                    fields[normalized] = self._csrf_placeholder(normalized, "", "")
+        return fields
+
+    def _csrf_placeholder(self, name: str, input_type: str, value: str) -> str:
+        lowered = name.lower()
+        if input_type.lower() in {"submit", "button"}:
+            return value or name
+        if any(token in lowered for token in ("password", "passwd", "pass")):
+            return "NOVA_CSRF_TEST_PASSWORD"
+        if "email" in lowered or "mail" in lowered:
+            return "nova-csrf@example.invalid"
+        if lowered in {"change", "save", "update", "submit", "action"}:
+            return value or name
+        return value or "NOVA_CSRF_TEST"
+
+    def _csrf_url(self, action_url: str, fields: dict[str, str]) -> str:
+        parsed = urlparse(action_url)
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        for name, value in fields.items():
+            query[name] = [value]
+        return parsed._replace(query=urlencode(query, doseq=True)).geturl()
+
+    def _xss_progression_candidates(self, webscan: dict, finding: dict) -> list[dict[str, Any]]:
+        finding_url = str(finding.get("url") or webscan.get("final_url") or webscan.get("target") or "")
+        target_param = self._target_param_from_finding(finding) or str((finding.get("details") or {}).get("target_param") or "")
+        input_point = self._input_point_for_param(webscan, target_param, finding_url) if target_param else finding_url
+        marker = re.sub(r"[^A-Za-z0-9_]", "_", target_param or "xss")[:24] or "xss"
+        return [
+            {
+                "source": "local_progression_template",
+                "input_point": input_point,
+                "category": "xss",
+                "target_param": target_param,
+                "payload": f"\"><svg/onload=alert('NOVA_{marker}')>",
+                "purpose": "确认 XSS 后的上下文逃逸候选：测试 HTML 属性闭合和 SVG 事件处理器执行。",
+                "expected_signal": f"浏览器触发 NOVA_{marker} alert，或响应中保留未编码的 svg/onload 片段。",
+                "risk_note": "仅写入报告供授权环境手工验证；NOVA 不会自动执行浏览器脚本。",
+            },
+            {
+                "source": "local_progression_template",
+                "input_point": input_point,
+                "category": "xss",
+                "target_param": target_param,
+                "payload": f"<img src=x onerror=alert('NOVA_{marker}')>",
+                "purpose": "确认 XSS 后的标签上下文候选：测试事件属性是否被过滤或编码。",
+                "expected_signal": f"浏览器触发 NOVA_{marker} alert，或响应中出现未编码 onerror 属性。",
+                "risk_note": "仅作为报告型候选，不自动请求目标。",
+            },
+        ]
+
+    def _lfi_progression_candidates(self, webscan: dict, finding: dict) -> list[dict[str, Any]]:
+        finding_url = str(finding.get("url") or webscan.get("final_url") or webscan.get("target") or "")
+        target_param = self._target_param_from_finding(finding) or str((finding.get("details") or {}).get("target_param") or "")
+        if not target_param:
+            return []
+        input_point = self._input_point_for_param(webscan, target_param, finding_url)
+        return [
+            {
+                "source": "local_progression_template",
+                "input_point": input_point,
+                "category": "lfi",
+                "target_param": target_param,
+                "payload": "../../../../../../etc/passwd",
+                "purpose": "确认 LFI/目录穿越后的只读复核候选：读取 Linux passwd 特征。",
+                "expected_signal": "响应中出现 root:x、daemon、/bin/bash 等只读文件特征。",
+                "risk_note": "只读候选，不写文件，不读取业务敏感文件；仅限授权靶场。",
+            },
+            {
+                "source": "local_progression_template",
+                "input_point": input_point,
+                "category": "traversal",
+                "target_param": target_param,
+                "payload": "..\\..\\..\\..\\windows\\win.ini",
+                "purpose": "确认路径穿越后的 Windows 只读复核候选。",
+                "expected_signal": "响应中出现 [fonts]、[extensions] 或 win.ini 特征。",
+                "risk_note": "只读候选，不写文件。",
+            },
+        ]
+
+    def _command_progression_candidates(self, webscan: dict, finding: dict) -> list[dict[str, Any]]:
+        finding_url = str(finding.get("url") or webscan.get("final_url") or webscan.get("target") or "")
+        target_param = self._target_param_from_finding(finding) or str((finding.get("details") or {}).get("target_param") or "")
+        if not target_param:
+            return []
+        input_point = self._input_point_for_param(webscan, target_param, finding_url)
+        return [
+            {
+                "source": "local_progression_template",
+                "input_point": input_point,
+                "category": "command_injection",
+                "target_param": target_param,
+                "payload": "127.0.0.1; echo NOVA_CMD_VERIFY",
+                "purpose": "确认命令注入后的非破坏性复核候选：输出唯一 echo 标记。",
+                "expected_signal": "响应中出现唯一标记 NOVA_CMD_VERIFY。",
+                "risk_note": "仅允许短 echo 标记，不包含下载、写文件、删除、反弹 shell 或长时间命令。",
+            }
+        ]
+
+    def _weak_session_progression_candidates(self, webscan: dict, finding: dict) -> list[dict[str, Any]]:
+        target_param = str((finding.get("details") or {}).get("target_param") or "session cookie")
+        finding_url = str(finding.get("url") or webscan.get("final_url") or webscan.get("target") or "")
+        if not finding_url:
+            return []
+        return [
+            {
+                "source": "local_progression_template",
+                "input_point": finding_url,
+                "category": "weak_session",
+                "target_param": target_param,
+                "payload": finding_url,
+                "purpose": "确认弱会话 ID 后的手工复核候选：重复触发 Generate 并观察 Cookie 是否递增、短数字或时间戳可预测。",
+                "expected_signal": f"连续响应中的 {target_param} Cookie 呈现可预测序列，攻击者可推测下一个 ID。",
+                "risk_note": "仅作为报告型复核步骤；NOVA 不尝试接管会话或猜测其他用户 Cookie。",
+            }
+        ]
+
+    def _open_redirect_progression_candidates(self, webscan: dict, finding: dict) -> list[dict[str, Any]]:
+        finding_url = str(finding.get("url") or webscan.get("final_url") or webscan.get("target") or "")
+        target_param = str((finding.get("details") or {}).get("target_param") or self._target_param_from_finding(finding) or "redirect")
+        if not finding_url:
+            return []
+        return [
+            {
+                "source": "local_progression_template",
+                "input_point": finding_url,
+                "category": "open_redirect",
+                "target_param": target_param,
+                "payload": "https://nova.invalid/redirect-check",
+                "purpose": "确认开放重定向后的手工复核候选：验证完整外部 URL 是否进入 Location。",
+                "expected_signal": "响应状态码为 30x，Location 指向 nova.invalid。",
+                "risk_note": "仅用于授权环境验证跳转边界；不要替换成真实第三方钓鱼或收集地址。",
+            },
+            {
+                "source": "local_progression_template",
+                "input_point": finding_url,
+                "category": "open_redirect",
+                "target_param": target_param,
+                "payload": "//nova.invalid/redirect-check",
+                "purpose": "确认开放重定向后的协议相对 URL 复核候选，适合检测只过滤 http:// 或 https:// 的实现。",
+                "expected_signal": "响应 Location 为 //nova.invalid/redirect-check，浏览器会按当前协议跳到外部 host。",
+                "risk_note": "仅写入报告，不自动访问。",
+            },
+        ]
+
+    def _javascript_progression_candidates(self, webscan: dict, finding: dict) -> list[dict[str, Any]]:
+        payloads = [str(item) for item in finding.get("payloads", []) if str(item).strip()]
+        if not payloads:
+            return []
+        return [
+            {
+                "source": "local_progression_template",
+                "input_point": str(finding.get("url") or webscan.get("final_url") or webscan.get("target") or ""),
+                "category": "javascript_exposure",
+                "target_param": str((finding.get("details") or {}).get("target_param") or "phrase,token"),
+                "payload": payloads[0],
+                "purpose": "确认 JavaScript 客户端校验绕过后的手工复核候选：复用本地规则已验证成功的 phrase/token 组合。",
+                "expected_signal": "响应正文出现 Well done!，说明服务端接受了可由前端逻辑推导出的 token。",
+                "risk_note": "仅适用于授权靶场或自有系统；NOVA 不会用 LLM 自动执行后续 payload。",
             }
         ]
 
@@ -479,6 +795,9 @@ class LLMPayloadAdvisor:
 
         if lowered_name in {"file", "path", "page", "template", "include", "lang"}:
             categories.extend(["traversal", "lfi"])
+
+        if lowered_name in {"url", "uri", "redirect", "redir", "next", "return", "returnurl", "callback", "continue", "dest", "destination"}:
+            categories.append("open_redirect")
 
         if input_type in {"text", "search", "query"} and not categories:
             categories.extend(["xss", "sqli"])
@@ -677,6 +996,8 @@ class LLMPayloadAdvisor:
             "必须只返回严格 JSON，格式为 {\"payloads\": [...]}，不要 Markdown，不要解释性散文。"
             "候选 payload 第一版只写入报告，不自动执行，也不能作为漏洞确认依据。"
             "对于 SQLi，请优先利用 column_count、reflected_markers、已执行 payload 推导只读 UNION/布尔推进候选。"
+            "对于 CSRF，请只生成报告型手工验证 PoC，例如 GET URL 或 img 标签触发片段；不要生成自动提交脚本或绕过登录内容。"
+            "对于 XSS、LFI、命令注入，请分别生成上下文逃逸、只读文件特征、短 echo 标记类候选，并写明预期响应。"
             "禁止生成 DROP、DELETE、UPDATE、INSERT、ALTER、TRUNCATE、INTO OUTFILE、LOAD_FILE、xp_cmdshell、"
             "反弹 shell、写文件、删文件、长时间 SLEEP/BENCHMARK 或批量数据拖取 payload。"
             "不要输出用于读取系统文件、写 webshell、绕过认证或破坏业务状态的 payload。"
@@ -719,7 +1040,7 @@ class LLMPayloadAdvisor:
                     "payloads": [
                         {
                             "input_point": "confirmed finding url or original input point",
-                            "category": "sqli_progression|sqli|sqli_blind|xss",
+                            "category": "sqli_progression|sqli|sqli_blind|xss|csrf|lfi|traversal|command_injection|weak_session|open_redirect|javascript_exposure",
                             "target_param": "parameter name",
                             "payload": "single candidate payload, or omit when using true/false pair",
                             "true_payload": "optional blind SQLi true case",
@@ -764,7 +1085,7 @@ class LLMPayloadAdvisor:
                 "pages": compact_pages,
                 "findings": findings[:10],
                 "requirements": {
-                    "categories": ["sqli", "sqli_progression", "sqli_blind", "xss", "lfi", "command_injection", "traversal"],
+                    "categories": ["sqli", "sqli_progression", "sqli_blind", "xss", "csrf", "lfi", "command_injection", "traversal", "ssrf", "open_redirect", "stored_xss", "file_upload", "weak_session", "javascript_exposure"],
                     "max_per_param": self.settings.llm_payload_max_per_param,
                     "do_not_repeat_same_payload_for_all_inputs": True,
                     "blind_sqli_pair_schema": {
@@ -778,7 +1099,7 @@ class LLMPayloadAdvisor:
                     "payloads": [
                         {
                             "input_point": "url or form action",
-                            "category": "sqli|sqli_progression|sqli_blind|xss|lfi|command_injection|traversal",
+                            "category": "sqli|sqli_progression|sqli_blind|xss|csrf|lfi|command_injection|traversal|ssrf|open_redirect|stored_xss|file_upload|weak_session|javascript_exposure",
                             "target_param": "parameter name",
                             "payload": "single candidate payload, or omit when using true/false pair",
                             "true_payload": "optional blind SQLi true case",

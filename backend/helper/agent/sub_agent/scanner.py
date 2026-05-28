@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import hashlib
 from http.cookies import SimpleCookie
 from html.parser import HTMLParser
 import re
@@ -70,8 +71,11 @@ class _PageParser(HTMLParser):
         self.title = ""
         self.links: list[str] = []
         self.scripts: list[str] = []
+        self.inline_scripts: list[str] = []
         self.forms: list[dict] = []
         self._in_title = False
+        self._in_script = False
+        self._current_script: list[str] = []
         self._current_form: dict | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
@@ -86,10 +90,17 @@ class _PageParser(HTMLParser):
                 self.links.append(link)
         elif tag == "script" and data.get("src"):
             self.scripts.append(urljoin(self.base_url, data["src"]))
+        elif tag == "script":
+            self._in_script = True
+            self._current_script = []
         elif tag == "form":
             self._current_form = {
                 "method": data.get("method", "GET").upper(),
                 "action": urljoin(self.base_url, data.get("action", self.base_url)),
+                "enctype": data.get("enctype", "application/x-www-form-urlencoded").lower(),
+                "page_url": self.base_url,
+                "active_testable": True,
+                "active_scope_reason": "in_scope",
                 "inputs": [],
             }
         elif tag in {"input", "textarea", "select"} and self._current_form is not None:
@@ -108,13 +119,34 @@ class _PageParser(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         if tag.lower() == "title":
             self._in_title = False
+        elif tag.lower() == "script" and self._in_script:
+            inline = "".join(self._current_script).strip()
+            if inline:
+                self.inline_scripts.append(inline)
+            self._in_script = False
+            self._current_script = []
         elif tag.lower() == "form" and self._current_form is not None:
+            self._finalize_form(self._current_form)
             self.forms.append(self._current_form)
             self._current_form = None
 
     def handle_data(self, data: str) -> None:
         if self._in_title:
             self.title += data.strip()
+        if self._in_script:
+            self._current_script.append(data)
+
+    def _finalize_form(self, form: dict) -> None:
+        file_inputs = [field for field in form.get("inputs", []) if field.get("type") == "file"]
+        names = " ".join(str(field.get("name", "")).lower() for field in form.get("inputs", []))
+        action = str(form.get("action", "")).lower()
+        purpose = "generic"
+        if file_inputs or "multipart/form-data" in str(form.get("enctype", "")):
+            purpose = "file_upload"
+        elif any(token in names or token in action for token in ("comment", "message", "content", "body", "post", "feedback")):
+            purpose = "stored_xss_candidate"
+        form["file_inputs"] = file_inputs
+        form["candidate_purpose"] = purpose
 
 
 class WebScannerAgent:
@@ -151,6 +183,7 @@ class WebScannerAgent:
 
             if self.settings.focus_target_path and not self._active_path_allowed(target_url, page.get("final_url") or url):
                 self._deactivate_page_inputs(page, "outside_target_path")
+                self._deactivate_page_forms(page, "outside_target_path")
                 events.append(
                     {
                         "url": page.get("final_url") or url,
@@ -159,6 +192,8 @@ class WebScannerAgent:
                         "reason": "outside_target_path",
                     }
                 )
+            if self.settings.focus_target_path:
+                self._deactivate_outside_target_active_surfaces(page, target_url)
 
             pages.append(page)
             for link in page.get("links", [])[: self.settings.max_links]:
@@ -238,6 +273,8 @@ class WebScannerAgent:
         html_sample = re.sub(r"\s+", " ", html[:3000]).strip()
         input_points = self._extract_input_points(final_url, parser.forms)
         input_points.extend(self._extract_query_input_points(final_url))
+        input_points.extend(self._extract_link_input_points(final_url, parser.links))
+        script_items = self._script_items(final_url, parser.scripts, parser.inline_scripts)
         return {
             "url": url,
             "depth": depth,
@@ -247,7 +284,7 @@ class WebScannerAgent:
             "headers": headers,
             "title": parser.title[:120],
             "links": self._dedupe(parser.links)[: self.settings.max_links],
-            "scripts": self._dedupe(parser.scripts)[: self.settings.max_links],
+            "scripts": script_items[: self.settings.max_links],
             "forms": parser.forms,
             "cookies": self._parse_cookies(headers),
             "input_points": self._dedupe_input_points(input_points),
@@ -280,6 +317,51 @@ class WebScannerAgent:
                 )
         return points
 
+    def _script_items(self, page_url: str, script_urls: list[str], inline_scripts: list[str]) -> list[dict]:
+        items: list[dict] = []
+        for index, inline in enumerate(inline_scripts, start=1):
+            sample = inline[: min(len(inline), self.settings.max_script_bytes)]
+            items.append(
+                {
+                    "url": f"{page_url}#inline-script-{index}",
+                    "inline": True,
+                    "content_sample": sample,
+                    "hash": hashlib.sha256(sample.encode("utf-8", errors="ignore")).hexdigest(),
+                }
+            )
+        for script_url in self._dedupe(script_urls)[: self.settings.max_links]:
+            item = {"url": script_url, "inline": False}
+            if self.settings.fetch_same_origin_scripts and self._same_origin(page_url, script_url):
+                fetched = self._fetch_script(script_url)
+                item.update(fetched)
+            items.append(item)
+        return items
+
+    def _same_origin(self, left_url: str, right_url: str) -> bool:
+        left = urlparse(left_url)
+        right = urlparse(right_url)
+        return left.scheme == right.scheme and left.netloc.lower() == right.netloc.lower()
+
+    def _fetch_script(self, script_url: str) -> dict:
+        request = Request(
+            script_url,
+            headers={"User-Agent": "NOVA-safe-scanner/1.0", **self.settings.auth_headers},
+            method="GET",
+        )
+        try:
+            with urlopen(request, timeout=self.settings.request_timeout) as response:
+                raw = response.read(self.settings.max_script_bytes)
+                charset = response.headers.get_content_charset() or "utf-8"
+                content = raw.decode(charset, errors="replace")
+                return {
+                    "content_sample": content,
+                    "body_length": len(content),
+                    "status_code": response.status,
+                    "hash": hashlib.sha256(content.encode("utf-8", errors="ignore")).hexdigest(),
+                }
+        except Exception as exc:
+            return {"fetch_error": str(exc)}
+
     def _active_path_allowed(self, target_url: str, candidate_url: str) -> bool:
         target = urlparse(target_url)
         candidate = urlparse(candidate_url)
@@ -296,6 +378,27 @@ class WebScannerAgent:
                 point["active_testable"] = False
                 point["active_scope_reason"] = reason
 
+    def _deactivate_page_forms(self, page: dict, reason: str) -> None:
+        for form in page.get("forms", []):
+            form["active_testable"] = False
+            form["active_scope_reason"] = reason
+
+    def _deactivate_outside_target_active_surfaces(self, page: dict, target_url: str) -> None:
+        for point in page.get("input_points", []):
+            if not point.get("active_testable"):
+                continue
+            point_url = str(point.get("url") or "")
+            if point_url and not self._active_path_allowed(target_url, point_url):
+                point["active_testable"] = False
+                point["active_scope_reason"] = "outside_target_path"
+        for form in page.get("forms", []):
+            if form.get("active_testable") is False:
+                continue
+            action = str(form.get("action") or form.get("page_url") or page.get("final_url") or "")
+            if action and not self._active_path_allowed(target_url, action):
+                form["active_testable"] = False
+                form["active_scope_reason"] = "outside_target_path"
+
     def _extract_query_input_points(self, url: str) -> list[dict]:
         parsed = urlparse(url)
         query = parse_qs(parsed.query, keep_blank_values=True)
@@ -311,6 +414,28 @@ class WebScannerAgent:
             }
             for name in query
         ]
+
+    def _extract_link_input_points(self, page_url: str, links: list[str]) -> list[dict]:
+        points: list[dict] = []
+        for link in links:
+            parsed = urlparse(link)
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            if not query:
+                continue
+            same_origin = self._same_origin(page_url, link)
+            for name in query:
+                points.append(
+                    {
+                        "name": name,
+                        "method": "GET",
+                        "url": link,
+                        "source": "link",
+                        "type": "query",
+                        "active_testable": same_origin,
+                        "form_defaults": {},
+                    }
+                )
+        return points
 
     def _form_defaults(self, form: dict) -> dict[str, str]:
         defaults: dict[str, str] = {}
@@ -355,6 +480,7 @@ class WebScannerAgent:
                 cookies.append(
                     {
                         "name": morsel.key,
+                        "value": morsel.value,
                         "secure": "secure" in lowered,
                         "httponly": "httponly" in lowered,
                         "samesite": morsel["samesite"] or "",

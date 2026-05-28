@@ -24,11 +24,18 @@ class PayloadAgent:
         ensure_dir(report_dir)
         target_probe = target_probe or webscan.get("target_probe", {})
         raw_findings = payload_result.get("findings", [])
+        raw_llm_advice = payload_result.get("llm_payload_advice", [])
         report_confirmed_only = self._env_bool("NOVA_REPORT_CONFIRMED_ONLY", True)
+        report_verifiable_candidates = self._env_bool("NOVA_REPORT_VERIFIABLE_CANDIDATES", True)
         findings_for_report = (
             [item for item in raw_findings if item.get("status") == "确认漏洞"]
             if report_confirmed_only
             else raw_findings
+        )
+        findings_for_report = self._findings_for_report(
+            raw_findings,
+            report_confirmed_only,
+            report_verifiable_candidates,
         )
         findings = [
             self._with_category_metadata(item)
@@ -38,8 +45,8 @@ class PayloadAgent:
                 reverse=True,
             )
         ]
+        findings = self._attach_finding_advice(findings, raw_llm_advice)
         finding_type_summary = self._finding_type_summary(findings)
-        raw_llm_advice = payload_result.get("llm_payload_advice", [])
         llm_advice = raw_llm_advice
         if report_confirmed_only and not findings:
             llm_advice = []
@@ -55,6 +62,7 @@ class PayloadAgent:
                 "total_findings": len(findings),
                 "raw_total_findings": len(raw_findings),
                 "report_confirmed_only": report_confirmed_only,
+                "report_verifiable_candidates": report_verifiable_candidates,
                 "risk_level": self._risk_level(findings),
                 "auth_required": bool(target_probe.get("auth_required")),
                 "auth_type_guess": target_probe.get("auth_type_guess", "none"),
@@ -96,6 +104,60 @@ class PayloadAgent:
             return default
         return value.strip().lower() in {"1", "true", "yes", "on"}
 
+    def _findings_for_report(
+        self,
+        raw_findings: list[dict],
+        report_confirmed_only: bool,
+        report_verifiable_candidates: bool,
+    ) -> list[dict]:
+        if not report_confirmed_only:
+            return raw_findings
+        result = []
+        for finding in raw_findings:
+            if self._is_confirmed(finding) or (
+                report_verifiable_candidates and self._is_verifiable_candidate(finding)
+            ):
+                result.append(finding)
+        return result
+
+    def _is_confirmed(self, finding: dict) -> bool:
+        return str(finding.get("status") or "") == "确认漏洞"
+
+    def _is_verifiable_candidate(self, finding: dict) -> bool:
+        status = str(finding.get("status") or "")
+        category = str(finding.get("category") or "")
+        details = finding.get("details") or {}
+        if category == "authentication":
+            return True
+        if status not in {"疑似漏洞", "待验证"}:
+            return False
+        if category in {"ssrf", "stored_xss", "file_upload"}:
+            return True
+        if category == "authentication":
+            return True
+        if details.get("opt_in_required"):
+            return True
+        return False
+
+    def _attach_finding_advice(self, findings: list[dict], advice: list[dict]) -> list[dict]:
+        attached = []
+        for finding in findings:
+            item = dict(finding)
+            matched = [entry for entry in advice if entry.get("allowed") and self._advice_matches_finding(item, entry)]
+            item["llm_payload_advice"] = matched
+            attached.append(item)
+        return attached
+
+    def _advice_matches_finding(self, finding: dict, advice: dict) -> bool:
+        if advice.get("category") == finding.get("category"):
+            return True
+        target_param = str((finding.get("details") or {}).get("target_param") or "")
+        if target_param and target_param == str(advice.get("target_param") or ""):
+            return True
+        finding_url = str(finding.get("url") or "")
+        input_point = str(advice.get("input_point") or "")
+        return bool(finding_url and input_point and finding_url.split("?")[0] == input_point.split("?")[0])
+
     def _risk_level(self, findings: list[dict]) -> str:
         if any(item.get("severity") == "Critical" for item in findings):
             return "Critical"
@@ -112,7 +174,42 @@ class PayloadAgent:
         category = str(item.get("category") or "unknown")
         item.setdefault("category_label", category_label(category))
         item.setdefault("category_group", category_group(category))
+        item.setdefault("executed_payloads", item.get("payloads", []))
+        item.setdefault("poc", self._legacy_poc(item))
+        item.setdefault("llm_payload_advice", [])
         return item
+
+    def _legacy_poc(self, finding: dict) -> dict[str, Any]:
+        details = finding.get("details") or {}
+        payloads = finding.get("payloads", [])
+        category = finding.get("category")
+        if category == "sqli_blind" and len(payloads) >= 2:
+            return {
+                "type": "boolean_pair",
+                "execution": "executed",
+                "url": finding.get("url", ""),
+                "target_param": details.get("target_param", ""),
+                "true_payload": payloads[0],
+                "false_payload": payloads[1],
+                "expected_signal": details.get("confirmation_basis", ""),
+            }
+        if category == "csrf" and details.get("evidence_type") == "get_state_change_form":
+            return {
+                "type": "manual",
+                "execution": "manual",
+                "url": finding.get("url", ""),
+                "payloads": payloads,
+                "expected_signal": "已登录用户跨站触发 GET 状态变更请求后，目标状态发生变化。",
+                "note": "NOVA 不自动触发该请求。",
+            }
+        return {
+            "type": "single_or_sequence" if payloads else "evidence_only",
+            "execution": "executed" if self._is_confirmed(finding) and payloads else "manual",
+            "url": finding.get("url", ""),
+            "target_param": details.get("target_param", ""),
+            "payloads": payloads,
+            "expected_signal": details.get("confirmation_basis", ""),
+        }
 
     def _finding_type_summary(self, findings: list[dict]) -> list[dict[str, Any]]:
         counts: dict[str, int] = {}
@@ -172,6 +269,7 @@ class PayloadAgent:
             f"- 确认漏洞：{summary.get('confirmed', 0)}",
             f"- 疑似漏洞：{summary.get('suspected', 0)}",
             f"- 报告过滤：{'仅展示确认漏洞' if summary.get('report_confirmed_only') else '展示全部发现'}",
+            f"- 可验证候选：{'展示' if summary.get('report_verifiable_candidates') else '隐藏'}",
             "",
             "## 目标探测结果",
             "",
@@ -209,7 +307,9 @@ class PayloadAgent:
                             f"- URL：{finding.get('url', 'N/A')}",
                             f"- 证据：{finding.get('evidence', 'N/A')}",
                             f"- 漏洞细化：{self._format_details(finding.get('details') or finding.get('request_response', {}).get('sqli_details', {}))}",
-                            f"- 已执行 payload：{', '.join(finding.get('payloads', [])) or 'N/A'}",
+                            f"- {self._payload_label(finding)}：{', '.join(finding.get('payloads', [])) or 'N/A'}",
+                            f"- PoC：{self._format_poc(finding.get('poc', {}))}",
+                            f"- LLM 后续 payload：{self._format_finding_advice(finding.get('llm_payload_advice', []))}",
                             f"- 请求/响应摘要：{self._format_evidence(finding.get('request_response', {}))}",
                             f"- 修复建议：{finding.get('recommendation', 'N/A')}",
                             f"- LLM 分析：{finding.get('llm_analysis', 'N/A') or 'N/A'}",
@@ -219,6 +319,44 @@ class PayloadAgent:
 
         lines.extend(self._candidate_payload_section(report))
         return "\n".join(lines) + "\n"
+
+    def _payload_label(self, finding: dict[str, Any]) -> str:
+        details = finding.get("details") or {}
+        if finding.get("category") == "csrf" and details.get("evidence_type") == "get_state_change_form":
+            return "证据/触发方式（未自动执行）"
+        return "已执行 payload"
+
+    def _format_poc(self, poc: dict[str, Any]) -> str:
+        if not poc:
+            return "N/A"
+        if poc.get("type") == "boolean_pair":
+            return (
+                f"true=`{poc.get('true_payload', '')}`；"
+                f"false=`{poc.get('false_payload', '')}`；"
+                f"预期：{poc.get('expected_signal') or '比较两次响应差异'}"
+            )
+        payloads = poc.get("payloads") or []
+        payload_text = "，".join(f"`{payload}`" for payload in payloads) if payloads else "N/A"
+        execution = {
+            "executed": "已由 NOVA 请求验证",
+            "manual": "手工验证",
+            "passive": "被动证据",
+        }.get(str(poc.get("execution") or ""), str(poc.get("execution") or "N/A"))
+        return (
+            f"{execution}；URL={poc.get('url') or 'N/A'}；"
+            f"payload={payload_text}；预期：{poc.get('expected_signal') or poc.get('confirmation_basis') or 'N/A'}"
+        )
+
+    def _format_finding_advice(self, advice: list[dict]) -> str:
+        if not advice:
+            return "N/A"
+        snippets = []
+        for item in advice[:3]:
+            payload = item.get("payload") or item.get("true_payload") or ""
+            snippets.append(
+                f"{category_label(item.get('category'))}/{item.get('source', 'llm')}: `{payload}`；用途：{item.get('purpose') or 'N/A'}"
+            )
+        return " | ".join(snippets)
 
     def _format_details(self, details: dict[str, Any]) -> str:
         if not details:
@@ -236,12 +374,30 @@ class PayloadAgent:
             parts.append(f"注释后缀={details.get('comment_suffix')}")
         if details.get("payload_pattern"):
             parts.append(f"推荐模式={details.get('payload_pattern')}")
+        if details.get("evidence_type"):
+            parts.append(f"证据类型={details.get('evidence_type')}")
+        if details.get("leak_type"):
+            parts.append(f"泄露类型={details.get('leak_type')}")
+        if details.get("signal"):
+            parts.append(f"信号={details.get('signal')}")
+        if details.get("weakness"):
+            parts.append(f"弱点={details.get('weakness')}")
+        if details.get("opt_in_required"):
+            parts.append(f"需要显式开启={details.get('opt_in_required')}")
+        if details.get("enabled_by"):
+            parts.append(f"由配置开启={details.get('enabled_by')}")
+        if details.get("nonce"):
+            parts.append(f"验证 nonce={details.get('nonce')}")
         if details.get("xss_type"):
             parts.append(f"XSS 类型={details.get('xss_type')}")
         if details.get("reflection_context"):
             parts.append(f"反射上下文={details.get('reflection_context')}")
         if details.get("confirmation_basis"):
             parts.append(f"确认依据={details.get('confirmation_basis')}")
+        if details.get("true_similarity") is not None:
+            parts.append(f"true 相似度={details.get('true_similarity')}")
+        if details.get("false_similarity") is not None:
+            parts.append(f"false 相似度={details.get('false_similarity')}")
         if details.get("techniques"):
             parts.append(f"验证技术={', '.join(details.get('techniques', []))}")
         if details.get("verification_method"):
@@ -287,12 +443,16 @@ class PayloadAgent:
         )
 
         if allowed:
-            grouped: dict[str, list[dict]] = defaultdict(list)
+            grouped: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
             for item in allowed:
-                key = item.get("input_point") or item.get("target_param") or "未标注输入点"
+                key = (
+                    str(item.get("category") or "unknown"),
+                    str(item.get("target_param") or "N/A"),
+                    str(item.get("input_point") or item.get("target_param") or "未标注输入点"),
+                )
                 grouped[key].append(item)
-            for input_point, items in grouped.items():
-                lines.extend([f"### 输入点：{input_point}", ""])
+            for (category, target_param, input_point), items in sorted(grouped.items(), key=lambda entry: category_sort_key(entry[0][0])):
+                lines.extend([f"### {category_label(category)} / 参数：{target_param}", "", f"- 输入点：{input_point}", ""])
                 pair_groups: dict[str, list[dict]] = defaultdict(list)
                 singles: list[dict] = []
                 for item in items:

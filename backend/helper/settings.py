@@ -61,6 +61,13 @@ class RuntimeSettings:
     active_scan: bool = True
     active_request_timeout: float = 3.0
     max_active_inputs: int = 5
+    command_injection_probes: bool = True
+    fetch_same_origin_scripts: bool = True
+    max_script_bytes: int = 200000
+    ssrf_callback_url: str | None = None
+    stored_xss_probes: bool = False
+    file_upload_probes: bool = False
+    open_redirect_probes: bool = True
     focus_target_path: bool = True
     llm_analysis: bool = True
     llm_on_local_targets: bool = True
@@ -68,6 +75,7 @@ class RuntimeSettings:
     llm_payload_max_per_param: int = 5
     llm_payload_report_only: bool = True
     report_confirmed_only: bool = True
+    report_verifiable_candidates: bool = True
     allowed_hosts: list[str] = field(default_factory=list)
     exclude_paths: list[str] = field(default_factory=list)
     auth_headers: dict[str, str] = field(default_factory=dict)
@@ -105,6 +113,13 @@ def load_runtime_settings() -> RuntimeSettings:
         active_scan=_env_bool("NOVA_ACTIVE_SCAN", True),
         active_request_timeout=_env_float("NOVA_ACTIVE_REQUEST_TIMEOUT", 3.0),
         max_active_inputs=_env_int("NOVA_MAX_ACTIVE_INPUTS", 5),
+        command_injection_probes=_env_bool("NOVA_COMMAND_INJECTION_PROBES", True),
+        fetch_same_origin_scripts=_env_bool("NOVA_FETCH_SAME_ORIGIN_SCRIPTS", True),
+        max_script_bytes=_env_int("NOVA_MAX_SCRIPT_BYTES", 200000),
+        ssrf_callback_url=os.getenv("NOVA_SSRF_CALLBACK_URL") or None,
+        stored_xss_probes=_env_bool("NOVA_STORED_XSS_PROBES", False),
+        file_upload_probes=_env_bool("NOVA_FILE_UPLOAD_PROBES", False),
+        open_redirect_probes=_env_bool("NOVA_OPEN_REDIRECT_PROBES", True),
         focus_target_path=_env_bool("NOVA_FOCUS_TARGET_PATH", True),
         llm_analysis=_env_bool("NOVA_LLM_ANALYSIS", True),
         llm_on_local_targets=_env_bool("NOVA_LLM_ON_LOCAL_TARGETS", True),
@@ -112,6 +127,7 @@ def load_runtime_settings() -> RuntimeSettings:
         llm_payload_max_per_param=_env_int("NOVA_LLM_PAYLOAD_MAX_PER_PARAM", 5),
         llm_payload_report_only=_env_bool("NOVA_LLM_PAYLOAD_REPORT_ONLY", True),
         report_confirmed_only=_env_bool("NOVA_REPORT_CONFIRMED_ONLY", True),
+        report_verifiable_candidates=_env_bool("NOVA_REPORT_VERIFIABLE_CANDIDATES", True),
         allowed_hosts=_env_list("NOVA_ALLOWED_HOSTS"),
         exclude_paths=_env_list("NOVA_EXCLUDE_PATHS"),
         auth_headers=auth_headers,
