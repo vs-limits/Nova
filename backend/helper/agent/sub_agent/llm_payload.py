@@ -35,6 +35,9 @@ ADVISORY_CATEGORIES = {
     "command injection": "command_injection",
     "command_injection": "command_injection",
     "csrf": "csrf",
+    "captcha": "captcha_bypass",
+    "captcha_bypass": "captcha_bypass",
+    "insecure captcha": "captcha_bypass",
     "cross site request forgery": "csrf",
     "cross_site_request_forgery": "csrf",
     "cross-site request forgery": "csrf",
@@ -186,9 +189,45 @@ class PayloadSafetyFilter:
             pair_id=pair_id,
             pair_role=pair_role,
         ).__dict__
+        result["poc_title"] = self._sanitize_report_text(str(candidate.get("poc_title") or ""))
+        result["attack_flow"] = self._sanitize_steps(
+            candidate.get("attack_flow") or candidate.get("poc_steps") or candidate.get("steps") or []
+        )
+        result["usage_advice"] = self._sanitize_report_text(str(candidate.get("usage_advice") or ""))
         if not allowed:
             result["payload_sha256"] = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         return result
+
+    def _sanitize_steps(self, raw_steps: object) -> list[str]:
+        if isinstance(raw_steps, str):
+            steps = [raw_steps]
+        elif isinstance(raw_steps, list):
+            steps = [str(item) for item in raw_steps]
+        else:
+            steps = []
+        sanitized = [self._sanitize_report_text(step) for step in steps if str(step).strip()]
+        return [step for step in sanitized if step][:6]
+
+    def _sanitize_report_text(self, text: str) -> str:
+        compact = re.sub(r"\s+", " ", text).strip()
+        if not compact:
+            return ""
+        for pattern, reason in self.DANGEROUS_PATTERNS:
+            if re.search(pattern, compact, re.I):
+                return f"[已过滤步骤：{reason}]"
+        blocked_phrases = (
+            "提权",
+            "持久化",
+            "横向移动",
+            "批量攻击",
+            "拖库",
+            "导出全部",
+            "窃取",
+            "真实受害者",
+        )
+        if any(phrase in compact for phrase in blocked_phrases):
+            return "[已过滤步骤：包含超出授权验证范围的攻击流程]"
+        return compact[:180]
 
     def _is_allowed(self, payload: str, category: str) -> tuple[bool, str]:
         lowered = payload.lower()
@@ -281,7 +320,11 @@ class LLMPayloadAdvisor:
                 llm_candidates = self._parse_candidates(raw)
                 for item in llm_candidates:
                     item.setdefault("source", "llm")
-                if confirmed_findings:
+            except Exception as exc:
+                llm_error = str(exc)
+
+            if confirmed_findings:
+                try:
                     raw_progression = self.llm.chat(
                         self._progression_system_prompt(),
                         self._progression_user_prompt(webscan, confirmed_findings),
@@ -290,8 +333,9 @@ class LLMPayloadAdvisor:
                     for item in progression_candidates:
                         item["source"] = "llm_progression"
                     llm_candidates.extend(progression_candidates)
-            except Exception as exc:
-                llm_error = str(exc)
+                except Exception as exc:
+                    progression_error = str(exc)
+                    llm_error = f"{llm_error}; progression: {progression_error}" if llm_error else f"progression: {progression_error}"
         elif self.settings.llm_enabled:
             llm_error = "当前配置禁止对本地/内网目标调用 LLM，可设置 NOVA_LLM_ON_LOCAL_TARGETS=true 开启"
         else:
@@ -300,10 +344,13 @@ class LLMPayloadAdvisor:
         candidates = self._dedupe_candidates(local_candidates + llm_candidates)
         limited = self._limit_per_param(candidates)
         filtered = self.filter.filter_many(limited)
+        filtered = self._limit_llm_items(filtered)
 
         status = "ok" if filtered else ("local_only" if local_candidates else "unavailable")
         message = "候选 Payload 已生成；第一版仅写入报告，不自动执行"
-        if llm_error and local_candidates:
+        if llm_error and llm_candidates:
+            message = f"LLM 候选已部分生成，但有部分调用失败：{llm_error}"
+        elif llm_error and local_candidates:
             message = f"LLM 不可用，已使用本地上下文模板生成候选：{llm_error}"
         elif llm_error:
             message = f"候选 Payload 未生成：{llm_error}"
@@ -319,7 +366,7 @@ class LLMPayloadAdvisor:
                 "allowed": len([item for item in filtered if item.get("allowed")]),
                 "blocked": len([item for item in filtered if not item.get("allowed")]),
                 "local_candidates": len(local_candidates),
-                "llm_candidates": len(llm_candidates),
+                "llm_candidates": len([item for item in filtered if str(item.get("source") or "").startswith("llm")]),
             },
         }
 
@@ -383,6 +430,8 @@ class LLMPayloadAdvisor:
                 candidates.extend(self._open_redirect_progression_candidates(webscan, finding))
             elif category == "javascript_exposure":
                 candidates.extend(self._javascript_progression_candidates(webscan, finding))
+            elif category == "captcha_bypass":
+                candidates.extend(self._captcha_progression_candidates(webscan, finding))
         return candidates
 
     def _sqli_progression_candidates(self, webscan: dict, finding: dict) -> list[dict[str, Any]]:
@@ -699,6 +748,23 @@ class LLMPayloadAdvisor:
             }
         ]
 
+    def _captcha_progression_candidates(self, webscan: dict, finding: dict) -> list[dict[str, Any]]:
+        payloads = [str(item) for item in finding.get("payloads", []) if str(item).strip()]
+        input_point = str(finding.get("url") or webscan.get("final_url") or webscan.get("target") or "")
+        return [
+            {
+                "source": "local_progression_template",
+                "input_point": input_point,
+                "category": "captcha_bypass",
+                "target_param": "step,password_new,password_conf,g-recaptcha-response",
+                "payload": payload,
+                "purpose": "确认 CAPTCHA 流程绕过后的手工复核 PoC；用于说明最终状态变更没有可靠绑定验证码通过状态。",
+                "expected_signal": "在授权 DVWA 环境手工提交后，页面出现 Password Changed. 或进入绕过后的确认阶段。",
+                "risk_note": "该 PoC 会修改当前用户密码，NOVA 只写入报告，不会自动执行。",
+            }
+            for payload in payloads
+        ]
+
     def _target_param_from_finding(self, finding: dict) -> str:
         parsed = urlparse(str(finding.get("url") or ""))
         query = parse_qs(parsed.query, keep_blank_values=True)
@@ -943,6 +1009,20 @@ class LLMPayloadAdvisor:
                 selected.append(candidate)
         return selected
 
+    def _limit_llm_items(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        max_total = max(1, getattr(self.settings, "llm_payload_max_total", 10))
+        selected: list[dict[str, Any]] = []
+        llm_items: list[dict[str, Any]] = []
+        for item in items:
+            source = str(item.get("source") or "")
+            if source.startswith("llm"):
+                llm_items.append(item)
+            else:
+                selected.append(item)
+
+        llm_items.sort(key=lambda item: 0 if item.get("source") == "llm_progression" else 1)
+        return selected + llm_items[:max_total]
+
     def _prioritize_candidates(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
         source_priority = {
             "llm_progression": 0,
@@ -983,8 +1063,10 @@ class LLMPayloadAdvisor:
             "必须只返回严格 JSON，不要 Markdown，不要解释性散文。"
             "payload 仅用于人工后续验证建议，第一版不会自动执行。"
             "必须按输入点上下文生成不同候选，不要对所有参数机械复用同一 payload。"
+            "总数必须控制在 max_total_payloads 以内；宁可少给，也不要给重复或边际价值低的 payload。"
             "SQL 盲注必须生成 true_payload 和 false_payload 成对候选，并写明 expected_true_signal 与 expected_false_signal。"
             "单条 payload 或单条 exists 响应不能证明 SQL 盲注。"
+            "可以补充 poc_title、attack_flow、usage_advice，但只能描述授权验证流程，不能描述提权、持久化、批量攻击、数据导出或绕过认证。"
             "禁止生成 DROP、DELETE、UPDATE、INSERT、ALTER、TRUNCATE、INTO OUTFILE、LOAD_FILE、"
             "xp_cmdshell、反弹 shell、写文件、长时间 SLEEP/BENCHMARK。"
         )
@@ -995,9 +1077,11 @@ class LLMPayloadAdvisor:
             "你的任务是生成报告参考用的后续推进候选 payload，不能重新判断漏洞是否存在。"
             "必须只返回严格 JSON，格式为 {\"payloads\": [...]}，不要 Markdown，不要解释性散文。"
             "候选 payload 第一版只写入报告，不自动执行，也不能作为漏洞确认依据。"
+            "总数必须控制在 max_total_payloads 以内；只给关键、重要、能推进验证的 payload，避免轻微变体刷屏。"
             "对于 SQLi，请优先利用 column_count、reflected_markers、已执行 payload 推导只读 UNION/布尔推进候选。"
             "对于 CSRF，请只生成报告型手工验证 PoC，例如 GET URL 或 img 标签触发片段；不要生成自动提交脚本或绕过登录内容。"
             "对于 XSS、LFI、命令注入，请分别生成上下文逃逸、只读文件特征、短 echo 标记类候选，并写明预期响应。"
+            "可以为每个候选补充 poc_title、attack_flow、usage_advice，但 attack_flow 必须是授权验证流程，不得包含提权、持久化、批量攻击、数据导出或真实第三方目标。"
             "禁止生成 DROP、DELETE、UPDATE、INSERT、ALTER、TRUNCATE、INTO OUTFILE、LOAD_FILE、xp_cmdshell、"
             "反弹 shell、写文件、删文件、长时间 SLEEP/BENCHMARK 或批量数据拖取 payload。"
             "不要输出用于读取系统文件、写 webshell、绕过认证或破坏业务状态的 payload。"
@@ -1030,6 +1114,12 @@ class LLMPayloadAdvisor:
                     "do_not_confirm_vulnerabilities": True,
                     "prefer_read_only_progression": True,
                     "max_per_param": self.settings.llm_payload_max_per_param,
+                    "max_total_payloads": self.settings.llm_payload_max_total,
+                    "prioritize": [
+                        "只保留最关键、最能说明风险的 payload",
+                        "优先给已确认漏洞的只读推进 payload",
+                        "避免同一目的的 payload 轻微变体",
+                    ],
                     "allowed_examples": [
                         "-1' UNION SELECT 1,database(),3 -- -",
                         "-1' UNION SELECT 1,version(),3 -- -",
@@ -1050,6 +1140,9 @@ class LLMPayloadAdvisor:
                             "expected_true_signal": "optional Chinese true signal",
                             "expected_false_signal": "optional Chinese false signal",
                             "risk_note": "Chinese short risk note, must mention report-only",
+                            "poc_title": "optional Chinese PoC title",
+                            "attack_flow": ["optional authorized validation step 1", "optional authorized validation step 2"],
+                            "usage_advice": "optional Chinese usage advice",
                         }
                     ]
                 },
@@ -1085,8 +1178,14 @@ class LLMPayloadAdvisor:
                 "pages": compact_pages,
                 "findings": findings[:10],
                 "requirements": {
-                    "categories": ["sqli", "sqli_progression", "sqli_blind", "xss", "csrf", "lfi", "command_injection", "traversal", "ssrf", "open_redirect", "stored_xss", "file_upload", "weak_session", "javascript_exposure"],
+                    "categories": ["sqli", "sqli_progression", "sqli_blind", "xss", "csrf", "lfi", "command_injection", "traversal", "ssrf", "open_redirect", "stored_xss", "file_upload", "weak_session", "javascript_exposure", "captcha_bypass"],
                     "max_per_param": self.settings.llm_payload_max_per_param,
+                    "max_total_payloads": self.settings.llm_payload_max_total,
+                    "prioritize": [
+                        "只给关键 payload，不要凑数量",
+                        "优先覆盖不同漏洞类型或不同验证目的",
+                        "避免同类 payload 的重复变体",
+                    ],
                     "do_not_repeat_same_payload_for_all_inputs": True,
                     "blind_sqli_pair_schema": {
                         "true_payload": "string",
@@ -1094,12 +1193,17 @@ class LLMPayloadAdvisor:
                         "expected_true_signal": "string",
                         "expected_false_signal": "string",
                     },
+                    "attack_flow_rules": [
+                        "只写授权验证流程，不写提权、持久化、数据导出、批量攻击或绕过认证步骤",
+                        "流程必须说明不由 NOVA 自动执行，需在靶场或授权目标中手工验证",
+                        "不同漏洞类型给出不同流程，不要所有参数复用同一套说明",
+                    ],
                 },
                 "output_schema": {
                     "payloads": [
                         {
                             "input_point": "url or form action",
-                            "category": "sqli|sqli_progression|sqli_blind|xss|csrf|lfi|command_injection|traversal|ssrf|open_redirect|stored_xss|file_upload|weak_session|javascript_exposure",
+                            "category": "sqli|sqli_progression|sqli_blind|xss|csrf|lfi|command_injection|traversal|ssrf|open_redirect|stored_xss|file_upload|weak_session|javascript_exposure|captcha_bypass",
                             "target_param": "parameter name",
                             "payload": "single candidate payload, or omit when using true/false pair",
                             "true_payload": "optional blind SQLi true case",
@@ -1109,6 +1213,9 @@ class LLMPayloadAdvisor:
                             "expected_true_signal": "optional Chinese true signal",
                             "expected_false_signal": "optional Chinese false signal",
                             "risk_note": "Chinese short risk note",
+                            "poc_title": "optional Chinese PoC title",
+                            "attack_flow": ["optional authorized validation step 1", "optional authorized validation step 2"],
+                            "usage_advice": "optional Chinese usage advice",
                         }
                     ]
                 },

@@ -73,7 +73,10 @@ class RuntimeSettings:
     llm_on_local_targets: bool = True
     llm_payload_advisor: bool = True
     llm_payload_max_per_param: int = 5
+    llm_payload_max_total: int = 10
     llm_payload_report_only: bool = True
+    llm_request_timeout: int = 30
+    llm_request_retries: int = 2
     report_confirmed_only: bool = True
     report_verifiable_candidates: bool = True
     allowed_hosts: list[str] = field(default_factory=list)
@@ -125,7 +128,10 @@ def load_runtime_settings() -> RuntimeSettings:
         llm_on_local_targets=_env_bool("NOVA_LLM_ON_LOCAL_TARGETS", True),
         llm_payload_advisor=_env_bool("NOVA_LLM_PAYLOAD_ADVISOR", True),
         llm_payload_max_per_param=_env_int("NOVA_LLM_PAYLOAD_MAX_PER_PARAM", 5),
+        llm_payload_max_total=_env_int("NOVA_LLM_PAYLOAD_MAX_TOTAL", 10),
         llm_payload_report_only=_env_bool("NOVA_LLM_PAYLOAD_REPORT_ONLY", True),
+        llm_request_timeout=_env_int("NOVA_LLM_REQUEST_TIMEOUT", 30),
+        llm_request_retries=_env_int("NOVA_LLM_REQUEST_RETRIES", 2),
         report_confirmed_only=_env_bool("NOVA_REPORT_CONFIRMED_ONLY", True),
         report_verifiable_candidates=_env_bool("NOVA_REPORT_VERIFIABLE_CANDIDATES", True),
         allowed_hosts=_env_list("NOVA_ALLOWED_HOSTS"),

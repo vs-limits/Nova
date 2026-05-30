@@ -16,7 +16,7 @@ NOVA 是一个轻量级、AI 辅助的 Web 安全审计 CLI。当前版本采用
 - 扩展规则：默认检测开放重定向、CSP 弱配置、JavaScript 暴露、弱会话标识和被动密码学弱点。
 - 高风险候选：SSRF、存储型 XSS、文件上传默认只做候选/疑似；显式开启后才做 callback、表单提交或 harmless 文件上传验证。
 - 候选 payload：LLM 和本地上下文模板可生成建议 payload，但必须经过本地 Safety Filter，且只写入报告。
-- 中文报告：生成 `reports/scan_report.md` 和 `reports/scan_report.json`。
+- 中文报告：每次扫描生成新的 Markdown/JSON 报告，文件名格式为 `漏洞名称_扫描日期.md/json`，例如 `命令注入_20260530_143000.md`。
 
 ## 工作流
 
@@ -28,8 +28,9 @@ main.py
   -> .Nova/Webscan_agent.json
   -> Auditor Agent
   -> .Nova/Auditor_agent.json
-  -> reports/scan_report.json
-  -> reports/scan_report.md
+  -> reports/扫描日期/
+      -> 漏洞名称_扫描日期.json
+      -> 漏洞名称_扫描日期.md
 ```
 
 ## 安装
@@ -99,6 +100,8 @@ NOVA 支持两类候选 payload 来源：
 
 候选 payload 第一版仅写入报告，不自动执行，也不参与漏洞确认。所有候选必须经过本地 Safety Filter。
 
+如果 LLM 可用，报告会额外生成 `## LLM PoC 与授权验证流程` 章节。该章节只展示来源为 `llm` 或 `llm_progression` 的 AI 内容，包括 LLM PoC 标题、PoC payload、预期现象、授权验证流程、使用建议和风险提示。这些内容仍然是“报告型建议”：NOVA 不会自动执行 LLM PoC，也不会把 LLM 输出作为漏洞确认依据。验证流程会经过本地文本过滤，包含提权、持久化、批量攻击、数据导出、绕过认证、反弹 shell、写文件、删除文件等高风险内容的步骤会被过滤或摘要化。
+
 报告和 JSON 会同时保留机器可读的 `category` 以及中文 `category_label` / `category_group`，例如 `sqli` 会显示为“SQL 注入（错误回显/UNION）”，`sqli_blind` 会显示为“SQL 盲注（布尔型）”。Markdown 报告会先给出“漏洞类型汇总”，再按类型分组展示发现项；默认展示确认漏洞和可验证候选，隐藏普通配置建议和扫描提示。
 
 Safety Filter 会阻止危险 payload，例如：
@@ -142,7 +145,7 @@ false: 1' AND '1'='2' #
 | `NOVA_MAX_PAGES` | `10` | 最大爬取页面数 |
 | `NOVA_MAX_DEPTH` | `1` | BFS 爬取深度 |
 | `NOVA_MAX_LINKS` | `30` | 每个页面保留的最大链接和脚本数量 |
-| `NOVA_REQUEST_TIMEOUT` | `10` | 请求和 LLM 调用超时时间，单位秒 |
+| `NOVA_REQUEST_TIMEOUT` | `10` | 目标 HTTP 请求超时时间，单位秒 |
 | `NOVA_RATE_LIMIT` | `0.2` | 爬虫请求间隔，单位秒 |
 | `NOVA_ACTIVE_SCAN` | `true` | 是否启用安全 GET 参数探测 |
 | `NOVA_ACTIVE_REQUEST_TIMEOUT` | `3.0` | 主动探测单个 payload 请求超时，单位秒 |
@@ -164,7 +167,10 @@ false: 1' AND '1'='2' #
 | `NOVA_LLM_ON_LOCAL_TARGETS` | `true` | 是否允许对 localhost、127.0.0.1、内网地址调用 LLM；本地靶场默认可以使用 LLM 做候选 payload 迭代 |
 | `NOVA_LLM_PAYLOAD_ADVISOR` | `true` | 是否启用候选 payload 生成 |
 | `NOVA_LLM_PAYLOAD_MAX_PER_PARAM` | `5` | 每个参数最多保留的候选数量 |
+| `NOVA_LLM_PAYLOAD_MAX_TOTAL` | `10` | LLM/LLM progression 候选 payload 总量上限；优先保留关键推进候选 |
 | `NOVA_LLM_PAYLOAD_REPORT_ONLY` | `true` | 候选 payload 是否仅报告。第一版按仅报告处理 |
+| `NOVA_LLM_REQUEST_TIMEOUT` | `30` | LLM 单次调用超时时间，单位秒；上下文较大或模型较慢时可调到 `60` |
+| `NOVA_LLM_REQUEST_RETRIES` | `2` | LLM 调用遇到临时 TLS/网络断开时的重试次数 |
 | `NOVA_REPORT_CONFIRMED_ONLY` | `true` | 报告是否过滤普通非确认项 |
 | `NOVA_REPORT_VERIFIABLE_CANDIDATES` | `true` | 在过滤模式下是否仍展示 SSRF、存储型 XSS、文件上传等可验证候选 |
 
@@ -175,10 +181,10 @@ false: 1' AND '1'='2' #
 - `.Nova/TargetProbe_agent.json`
 - `.Nova/Webscan_agent.json`
 - `.Nova/Auditor_agent.json`
-- `reports/scan_report.json`
-- `reports/scan_report.md`
+- `reports/扫描日期/漏洞名称_扫描日期.json`
+- `reports/扫描日期/漏洞名称_扫描日期.md`
 
-这些运行产物已在 `.gitignore` 中忽略，不会提交到仓库。
+报告文件会先进入以扫描时间命名的新文件夹；如果同一秒内生成同名文件夹，NOVA 会自动追加 `_2`、`_3` 等序号。每个文件夹内保存本次扫描的 Markdown 和 JSON 报告。这些运行产物已在 `.gitignore` 中忽略，不会提交到仓库。
 
 ## DVWA 示例
 
@@ -189,11 +195,12 @@ python main.py --url http://127.0.0.1/DVWA/vulnerabilities/sqli/ --cookie "PHPSE
 python main.py --url http://127.0.0.1/DVWA/vulnerabilities/sqli_blind/ --cookie "PHPSESSID=your_value; security=low"
 python main.py --url http://127.0.0.1/DVWA/vulnerabilities/xss_r/ --cookie "PHPSESSID=your_value; security=low"
 python main.py --url http://127.0.0.1/DVWA/vulnerabilities/fi/?page=include.php --cookie "PHPSESSID=your_value; security=low"
-python main.py --url "http://127.0.0.1/DVWA/vulnerabilities/exec/?ip=127.0.0.1&Submit=Submit" --cookie "PHPSESSID=your_value; security=low"
+python main.py --url http://127.0.0.1/DVWA/vulnerabilities/exec/ --cookie "PHPSESSID=your_value; security=low"
 python main.py --url http://127.0.0.1/DVWA/vulnerabilities/weak_id/ --cookie "PHPSESSID=your_value; security=low"
 python main.py --url http://127.0.0.1/DVWA/vulnerabilities/javascript/ --cookie "PHPSESSID=your_value; security=low"
 python main.py --url http://127.0.0.1/DVWA/vulnerabilities/open_redirect/ --cookie "PHPSESSID=your_value; security=low"
 python main.py --url http://127.0.0.1/DVWA/vulnerabilities/csp/ --cookie "PHPSESSID=your_value; security=low"
+python main.py --url http://127.0.0.1/DVWA/vulnerabilities/captcha/ --cookie "PHPSESSID=your_value; security=low"
 ```
 
 如果登录态有效，NOVA 会识别 DVWA 页面中的 GET 表单参数，并尝试用本地规则验证 SQLi、XSS、LFI/目录穿越、命令注入或弱会话 ID 生成风险。候选 payload 会写入报告，但不会自动执行。
@@ -204,7 +211,7 @@ python main.py --url http://127.0.0.1/DVWA/vulnerabilities/csp/ --cookie "PHPSES
 
 DOM XSS 页面不会通过普通 HTTP 客户端执行 JavaScript。NOVA 对 `/xss_d/` 这类页面使用轻量 source-to-sink 静态规则：当 URL 参数进入 `document.location/location.href` 并写入 `document.write/innerHTML` 等 sink 时，报告为“DOM 型跨站脚本 XSS”。
 
-LFI/目录穿越只会对 `file/path/page/template/include` 等路径型 GET 参数尝试只读探测，并以 `/etc/passwd` 或 `win.ini` 这类稳定特征作为确认依据。命令注入只会对 `cmd/command/ip/host/ping/target` 等命令型参数发送短 `echo NOVA_CMD` 标记 payload，只有响应中出现唯一标记才确认。
+LFI/目录穿越只会对 `file/path/page/template/include` 等路径型 GET 参数尝试只读探测，并以 `/etc/passwd` 或 `win.ini` 这类稳定特征作为确认依据。命令注入只会对 `cmd/command/ip/host/ping/target` 等命令型参数发送短 `echo NOVA_CMD` 标记 payload，只有响应中出现唯一标记才确认。对 DVWA `/exec/` 这类明确的命令注入靶场表单，NOVA 也会提交同源 POST 的短 `echo NOVA_CMD` 标记验证，不执行删除、写文件、下载或反弹 shell 等危险命令。
 
 开放重定向会对 `url/next/redirect/return/callback/continue` 等 GET 参数使用 `https://nova.invalid/redirect-check` 做无副作用跳转验证。SSRF 只在配置 `NOVA_SSRF_CALLBACK_URL` 后主动验证；未配置时仅报告候选输入点。存储型 XSS 和文件上传默认也只报告候选表单，避免污染业务数据或留下文件。
 
@@ -213,6 +220,8 @@ DVWA Open Redirect 页面里的漏洞入口是带 `redirect` 参数的链接，�
 DVWA JavaScript 页面属于客户端校验绕过。NOVA 会识别 `phrase/token` 表单，使用本地规则计算 low/medium/high 三类 token 并提交 `phrase=success` 做验证；只有响应出现 `Well done!` 才报告为“确认存在 JavaScript 客户端校验绕过”。
 
 DVWA CSP 页面属于 CSP Bypass challenge。NOVA 会识别 `include` 表单和 CSP 响应头：low 级别验证白名单外部脚本是否能被用户控制为 `script src`，medium 级别验证 nonce 是否可被复用，high 级别验证同源 JSONP callback 是否可控。只有响应中出现对应可执行脚本证据时才报告为确认漏洞。
+
+DVWA CAPTCHA 页面属于 Insecure CAPTCHA 流程绕过。NOVA 会识别 `password_new/password_conf/step/Change` 这类改密码流程字段，以及 low/medium/high 中可手工复现的绕过信号，并在报告里给出手工 PoC；为了避免真实修改密码，NOVA 不会自动提交这些 PoC，也不会把它们写成“已执行 payload”。
 
 DVWA CSRF 页面通常是 GET 改密码表单。NOVA 不会提交该表单，但会根据 `password_new/password_conf/Change` 等状态变更字段和缺失 Token 证据，将其报告为“确认存在 GET 状态变更 CSRF 风险”。
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from urllib.parse import urlparse
+
 from backend.helper.evidence.finding import FindingFactory
 from backend.helper.evidence.http import HttpClient
 from backend.helper.evidence.matchers import prefer_xss_checks
@@ -14,6 +16,8 @@ from backend.helper.vuln_rules.rules import (
     CspWeaknessRule,
     CsrfTokenRule,
     DomXssRule,
+    DvwaCaptchaBypassRule,
+    DvwaCommandInjectionFormRule,
     DvwaCspBypassRule,
     DvwaJavascriptRule,
     FileInclusionRule,
@@ -51,11 +55,13 @@ class RuleRegistry:
             PassiveDisclosureRule(),
         ]
         self.page_rules = page_rules or [
+            DvwaCaptchaBypassRule(),
             DvwaCspBypassRule(),
             DvwaJavascriptRule(),
             JavaScriptAnalysisRule(),
         ]
         self.form_rules = form_rules or [
+            DvwaCommandInjectionFormRule(),
             CsrfTokenRule(),
             WeakSessionGenerateRule(),
             StoredXssRule(),
@@ -118,6 +124,8 @@ class RuleRegistry:
         if not any(page.get("forms") for page in pages) and webscan.get("forms"):
             pages = [webscan]
         for page in pages:
+            if not self._page_in_focused_target_path(settings, target, page):
+                continue
             context = RuleContext(
                 settings=settings,
                 webscan=webscan,
@@ -228,3 +236,19 @@ class RuleRegistry:
         if prefer_xss_checks(page, input_point):
             return [dom, reflected, redirect, ssrf, sqli, lfi, command, pending]
         return [dom, redirect, ssrf, sqli, lfi, command, reflected, pending]
+
+    def _page_in_focused_target_path(self, settings: RuntimeSettings, target: str, page: dict) -> bool:
+        if not settings.focus_target_path:
+            return True
+        if page.get("active_testable") is False and page.get("active_scope_reason") == "outside_target_path":
+            return False
+
+        target_path = urlparse(target).path or "/"
+        if target_path == "/":
+            return True
+        page_url = str(page.get("final_url") or page.get("url") or "")
+        if not page_url:
+            return True
+        page_path = urlparse(page_url).path or "/"
+        normalized_target = target_path.rstrip("/")
+        return page_path == normalized_target or page_path.startswith(f"{normalized_target}/")

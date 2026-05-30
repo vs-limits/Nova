@@ -90,6 +90,17 @@ class FindingFactory:
                 "confirmation_basis": confirmation_basis,
                 "note": "NOVA 只根据表单结构确认风险，不会自动触发该状态变更请求。",
             }
+        if category == "captcha_bypass":
+            return {
+                "type": "manual",
+                "execution": "manual",
+                "url": url,
+                "target_param": target_param,
+                "payloads": payloads,
+                "expected_signal": confirmation_basis or request_response.get("matched", ""),
+                "confirmation_basis": confirmation_basis,
+                "note": "NOVA 只生成 CAPTCHA 绕过的手工 PoC，不会自动提交会修改密码的请求。",
+            }
         if category == "sqli_blind" and len(payloads) >= 2:
             return {
                 "type": "boolean_pair",
@@ -141,6 +152,7 @@ class FindingFactory:
             "ssrf": "对服务端发起请求的 URL 做协议、主机和网段白名单校验，并禁止访问内网、环回和云元数据地址。",
             "file_upload": "限制上传类型、大小和存储位置，重命名文件并禁止上传内容被脚本解释执行。",
             "open_redirect": "只允许跳转到固定白名单路径或同源 URL，禁止直接信任用户提供的完整 URL。",
+            "captcha_bypass": "验证码通过状态必须与最终状态变更在服务端强绑定；不要信任客户端隐藏字段、固定响应值或可伪造请求头。",
             "weak_session": "使用高熵随机会话 ID，设置 Secure/HttpOnly/SameSite，并避免可预测或可解码的敏感会话内容。",
             "crypto_weakness": "禁用弱算法和明文敏感 token，避免 JWT alg=none，并优先使用现代 TLS 与成熟密码库。",
             "availability": "检查目标可达性、DNS、TLS 和网络连通性配置。",

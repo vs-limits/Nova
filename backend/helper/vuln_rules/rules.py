@@ -650,6 +650,84 @@ class DvwaJavascriptRule:
         return [("low", low), ("medium", medium), ("high", high)]
 
 
+class DvwaCommandInjectionFormRule:
+    rule_id = "dvwa_command_injection_form"
+    phase = "form"
+
+    def evaluate(self, context: RuleContext) -> list[dict]:
+        if not context.settings.active_scan or not context.settings.command_injection_probes:
+            return []
+        page = context.page or {}
+        form = context.form or {}
+        page_url = str(page.get("final_url") or page.get("url") or context.target)
+        title = str(page.get("title") or "").lower()
+        if "/exec/" not in page_url.lower() and "command injection" not in title:
+            return []
+
+        names = {str(field.get("name") or "").lower() for field in form.get("inputs", [])}
+        target_param = self._target_param(names)
+        if not target_param:
+            return []
+
+        marker = "NOVA_CMD"
+        payloads = [f"127.0.0.1; echo {marker}", f"127.0.0.1 && echo {marker}", f"127.0.0.1 | echo {marker}"]
+        action = str(form.get("action") or page_url)
+        for payload in payloads:
+            allowed, reason = safe_active_payload(payload)
+            if not allowed:
+                continue
+            response = context.http_client.post_form(action, self._form_fields(form, target_param, payload))
+            if not response:
+                continue
+            signal = command_signal(str(response.get("body") or ""), marker=marker)
+            if signal:
+                return [
+                    context.finding(
+                        context.new_id("CMD"),
+                        "确认存在命令注入",
+                        "Critical",
+                        "High",
+                        "command_injection",
+                        response.get("url") or action,
+                        f"DVWA exec 表单参数 {target_param} 的非破坏性 echo payload 在响应中回显了唯一标记 {marker}。",
+                        payloads=[f"POST {action} {target_param}={payload}"],
+                        status=STATUS_CONFIRMED,
+                        request_response=response_evidence(response, matched=signal),
+                        details={
+                            "rule_id": self.rule_id,
+                            "evidence_type": "command_echo_marker",
+                            "target_param": target_param,
+                            "safety_filter": reason,
+                            "confirmation_basis": "响应中出现由 echo 命令产生的唯一标记",
+                            "method": "POST",
+                        },
+                    )
+                ]
+        return []
+
+    def _target_param(self, names: set[str]) -> str:
+        for name in ("ip", "host", "target", "cmd", "command"):
+            if name in names:
+                return name
+        return ""
+
+    def _form_fields(self, form: dict, target_param: str, payload: str) -> dict[str, str]:
+        fields: dict[str, str] = {}
+        for field in form.get("inputs", []):
+            name = str(field.get("name") or "")
+            if not name:
+                continue
+            input_type = str(field.get("type") or "").lower()
+            if name == target_param:
+                fields[name] = payload
+            elif input_type in {"submit", "button"}:
+                fields[name] = str(field.get("value") or name)
+            else:
+                fields[name] = str(field.get("value") or "")
+        fields.setdefault(target_param, payload)
+        return fields
+
+
 class DvwaCspBypassRule:
     rule_id = "dvwa_csp_bypass"
     phase = "page"
@@ -805,6 +883,80 @@ class DvwaCspBypassRule:
     def _nonce_from_csp(self, csp: str) -> str:
         match = re.search(r"'nonce-([^']+)'", csp)
         return match.group(1) if match else ""
+
+
+class DvwaCaptchaBypassRule:
+    rule_id = "dvwa_captcha_bypass"
+    phase = "page"
+
+    def evaluate(self, context: RuleContext) -> list[dict]:
+        page = context.page or {}
+        page_url = str(page.get("final_url") or page.get("url") or context.target)
+        title = str(page.get("title") or "").lower()
+        if "/captcha/" not in page_url.lower() and "insecure captcha" not in title:
+            return []
+
+        form = self._captcha_form(page)
+        if not form:
+            return []
+
+        html = str(page.get("html_sample") or page.get("response_summary") or "")
+        poc = self._poc_payloads(html)
+        evidence_parts = [
+            "页面为 DVWA Insecure CAPTCHA 模块",
+            "表单包含 password_new/password_conf/step/Change 等改密码流程字段",
+        ]
+        if "reCAPTCHA API key missing" in html or "g-recaptcha-response" in html:
+            evidence_parts.append("页面包含 reCAPTCHA 流程信号")
+        if "hidd3n_valu3" in html or "User-Agent: 'reCAPTCHA'" in html:
+            evidence_parts.append("页面泄露 high 级别绕过提示 hidd3n_valu3/User-Agent: reCAPTCHA")
+
+        return [
+            context.finding(
+                context.new_id("CAPTCHA"),
+                "确认存在 CAPTCHA 流程绕过风险",
+                "High",
+                "High",
+                "captcha_bypass",
+                str(form.get("action") or page_url),
+                "；".join(evidence_parts) + "。",
+                payloads=poc,
+                status=STATUS_CONFIRMED,
+                request_response={
+                    "matched": "Insecure CAPTCHA password-change flow",
+                    "form_action": form.get("action") or page_url,
+                    "input_names": [field.get("name") for field in form.get("inputs", []) if field.get("name")],
+                },
+                details={
+                    "rule_id": self.rule_id,
+                    "evidence_type": "dvwa_insecure_captcha_flow",
+                    "target_param": "step,password_new,password_conf,g-recaptcha-response",
+                    "confirmation_basis": "DVWA CAPTCHA 页面存在可被手工复现的验证码流程绕过：low 可直接提交 step=2，medium 信任 hidden passed_captcha，high 泄露固定 g-recaptcha-response 与 User-Agent 条件；NOVA 不自动提交改密码请求。",
+                },
+            )
+        ]
+
+    def _captcha_form(self, page: dict) -> dict:
+        for form in page.get("forms", []):
+            names = {str(field.get("name") or "").lower() for field in form.get("inputs", [])}
+            if {"password_new", "password_conf", "step"} <= names and "change" in names:
+                return form
+        return {}
+
+    def _poc_payloads(self, html: str) -> list[str]:
+        payloads = [
+            "LOW 手工 PoC: POST step=2&password_new=NOVA_TEST_PASS&password_conf=NOVA_TEST_PASS&Change=Change",
+            "MEDIUM 手工 PoC: POST step=2&password_new=NOVA_TEST_PASS&password_conf=NOVA_TEST_PASS&passed_captcha=true&Change=Change",
+        ]
+        if "hidd3n_valu3" in html or "User-Agent: 'reCAPTCHA'" in html:
+            payloads.append(
+                "HIGH 手工 PoC: Header User-Agent: reCAPTCHA; POST password_new=NOVA_TEST_PASS&password_conf=NOVA_TEST_PASS&g-recaptcha-response=hidd3n_valu3&Change=Change"
+            )
+        else:
+            payloads.append(
+                "HIGH 候选 PoC: 若页面源码泄露 DEV NOTE，则使用 Header User-Agent: reCAPTCHA 与 g-recaptcha-response=hidd3n_valu3"
+            )
+        return payloads
 
 
 class StoredXssRule:

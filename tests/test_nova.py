@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+
+import requests
 
 from backend.helper.agent.sub_agent.auditor import AuditorAgent
 from backend.helper.agent.sub_agent.llm_payload import LLMPayloadAdvisor, PayloadSafetyFilter
@@ -42,7 +45,10 @@ def settings(**overrides) -> RuntimeSettings:
         "llm_on_local_targets": True,
         "llm_payload_advisor": True,
         "llm_payload_max_per_param": 5,
+        "llm_payload_max_total": 10,
         "llm_payload_report_only": True,
+        "llm_request_timeout": 30,
+        "llm_request_retries": 2,
         "report_confirmed_only": True,
         "report_verifiable_candidates": True,
         "allowed_hosts": [],
@@ -365,6 +371,8 @@ def test_scanner_focuses_active_inputs_on_target_path(monkeypatch) -> None:
     assert points["username"]["active_testable"] is False
     assert points["username"]["active_scope_reason"] == "outside_target_path"
     brute_page = next(page for page in result["pages"] if page["final_url"].endswith("/brute/"))
+    assert brute_page["active_testable"] is False
+    assert brute_page["active_scope_reason"] == "outside_target_path"
     assert brute_page["forms"][0]["active_testable"] is False
     assert brute_page["forms"][0]["active_scope_reason"] == "outside_target_path"
 
@@ -1114,6 +1122,64 @@ def test_auditor_confirms_command_injection_with_echo_marker(monkeypatch) -> Non
     assert "NOVA_CMD" in finding["request_response"]["matched"]
 
 
+def test_auditor_confirms_dvwa_exec_post_form_command_injection(monkeypatch) -> None:
+    calls: list[tuple[str, dict[str, str]]] = []
+
+    def fake_post_form(_self, url: str, fields: dict[str, str]):
+        calls.append((url, fields))
+        body = "ping output NOVA_CMD" if "echo NOVA_CMD" in fields.get("ip", "") else "ping output"
+        return {
+            "url": url,
+            "status_code": 200,
+            "headers": {"Content-Type": "text/html"},
+            "body": body,
+            "body_length": len(body),
+        }
+
+    monkeypatch.setattr("backend.helper.evidence.http.HttpClient.post_form", fake_post_form)
+    webscan = {
+        "target": "http://127.0.0.1/DVWA/vulnerabilities/exec/",
+        "reachable": True,
+        "headers": {
+            "Content-Security-Policy": "default-src 'self'",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+        "cookies": [],
+        "forms": [],
+        "pages": [
+            {
+                "final_url": "http://127.0.0.1/DVWA/vulnerabilities/exec/",
+                "active_testable": True,
+                "title": "Vulnerability: Command Injection :: DVWA",
+                "forms": [
+                    {
+                        "method": "POST",
+                        "action": "http://127.0.0.1/DVWA/vulnerabilities/exec/",
+                        "active_testable": True,
+                        "inputs": [
+                            {"name": "ip", "type": "text", "value": ""},
+                            {"name": "Submit", "type": "submit", "value": "Submit"},
+                        ],
+                    }
+                ],
+                "input_points": [],
+                "scripts": [],
+            }
+        ],
+    }
+
+    audit = AuditorAgent(settings(active_scan=True, llm_payload_advisor=False)).audit(webscan)
+    finding = next(item for item in audit["findings"] if item["category"] == "command_injection")
+
+    assert finding["status"] == "确认漏洞"
+    assert finding["details"]["rule_id"] == "dvwa_command_injection_form"
+    assert finding["details"]["method"] == "POST"
+    assert "NOVA_CMD" in finding["request_response"]["matched"]
+    assert calls[0][1]["ip"].startswith("127.0.0.1")
+
+
 def test_auditor_detects_passive_error_disclosure() -> None:
     webscan = {
         "target": "http://example.com/debug",
@@ -1306,6 +1372,114 @@ def test_auditor_confirms_dvwa_csp_external_script_bypass(monkeypatch) -> None:
     assert finding["details"]["evidence_type"] == "external_script_whitelist_bypass"
     assert "https://digi.ninja/dvwa/alert.js" in finding["payloads"]
     assert calls[0]["include"] == "https://digi.ninja/dvwa/alert.js"
+
+
+def test_auditor_confirms_dvwa_captcha_bypass_without_posting(monkeypatch) -> None:
+    def fail_post(*_args, **_kwargs):
+        raise AssertionError("CAPTCHA bypass rule must not submit password-change PoC")
+
+    monkeypatch.setattr("backend.helper.evidence.http.HttpClient.post_form", fail_post)
+    webscan = {
+        "target": "http://127.0.0.1/DVWA/vulnerabilities/captcha/",
+        "reachable": True,
+        "headers": {
+            "Content-Security-Policy": "default-src 'self'",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+        "cookies": [],
+        "forms": [],
+        "pages": [
+            {
+                "final_url": "http://127.0.0.1/DVWA/vulnerabilities/captcha/",
+                "title": "Vulnerability: Insecure CAPTCHA :: DVWA",
+                "html_sample": "Vulnerability: Insecure CAPTCHA <!-- **DEV NOTE**   Response: 'hidd3n_valu3'   &&   User-Agent: 'reCAPTCHA'   **/DEV NOTE** -->",
+                "forms": [
+                    {
+                        "method": "POST",
+                        "action": "http://127.0.0.1/DVWA/vulnerabilities/captcha/",
+                        "active_testable": True,
+                        "inputs": [
+                            {"name": "step", "type": "hidden", "value": "1"},
+                            {"name": "password_new", "type": "password", "value": ""},
+                            {"name": "password_conf", "type": "password", "value": ""},
+                            {"name": "g-recaptcha-response", "type": "hidden", "value": ""},
+                            {"name": "Change", "type": "submit", "value": "Change"},
+                        ],
+                    }
+                ],
+                "input_points": [],
+                "scripts": [],
+            }
+        ],
+    }
+
+    audit = AuditorAgent(settings(active_scan=True, llm_payload_advisor=False)).audit(webscan)
+    finding = next(item for item in audit["findings"] if item["category"] == "captcha_bypass")
+
+    assert finding["status"] == "确认漏洞"
+    assert finding["details"]["evidence_type"] == "dvwa_insecure_captcha_flow"
+    assert finding["poc"]["execution"] == "manual"
+    assert finding["executed_payloads"] == []
+    assert any("hidd3n_valu3" in payload for payload in finding["payloads"])
+
+
+def test_auditor_skips_page_rules_outside_focused_target_path(monkeypatch) -> None:
+    def fail_post(*_args, **_kwargs):
+        raise AssertionError("off-target page rules must not submit requests")
+
+    monkeypatch.setattr("backend.helper.evidence.http.HttpClient.post_form", fail_post)
+    webscan = {
+        "target": "http://127.0.0.1/DVWA/vulnerabilities/exec/",
+        "reachable": True,
+        "headers": {
+            "Content-Security-Policy": "default-src 'self'",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+        "cookies": [],
+        "forms": [],
+        "pages": [
+            {
+                "final_url": "http://127.0.0.1/DVWA/vulnerabilities/exec/",
+                "active_testable": True,
+                "title": "Vulnerability: Command Injection :: DVWA",
+                "forms": [],
+                "input_points": [],
+                "scripts": [],
+            },
+            {
+                "final_url": "http://127.0.0.1/DVWA/vulnerabilities/captcha/",
+                "active_testable": False,
+                "active_scope_reason": "outside_target_path",
+                "title": "Vulnerability: Insecure CAPTCHA :: DVWA",
+                "html_sample": "Vulnerability: Insecure CAPTCHA g-recaptcha-response",
+                "forms": [
+                    {
+                        "method": "POST",
+                        "action": "http://127.0.0.1/DVWA/vulnerabilities/captcha/",
+                        "active_testable": False,
+                        "active_scope_reason": "outside_target_path",
+                        "inputs": [
+                            {"name": "step", "type": "hidden", "value": "1"},
+                            {"name": "password_new", "type": "password", "value": ""},
+                            {"name": "password_conf", "type": "password", "value": ""},
+                            {"name": "g-recaptcha-response", "type": "hidden", "value": ""},
+                            {"name": "Change", "type": "submit", "value": "Change"},
+                        ],
+                    }
+                ],
+                "input_points": [],
+                "scripts": [],
+            },
+        ],
+    }
+
+    audit = AuditorAgent(settings(active_scan=True, llm_payload_advisor=False)).audit(webscan)
+
+    assert all(item["category"] != "captcha_bypass" for item in audit["findings"])
 
 
 def test_auditor_confirms_dvwa_weak_session_id_generation(monkeypatch) -> None:
@@ -1865,6 +2039,37 @@ def test_llm_payload_safety_filter_allows_read_only_sqli_progression() -> None:
     assert "LOAD_FILE" in blocked[0]["filter_reason"]
 
 
+def test_llm_payload_safety_filter_keeps_safe_poc_flow_and_redacts_dangerous_steps() -> None:
+    filter_ = PayloadSafetyFilter()
+    results = filter_.filter_many(
+        [
+            {
+                "input_point": "http://example.com/exec",
+                "category": "command_injection",
+                "target_param": "ip",
+                "payload": "127.0.0.1; echo NOVA_CMD",
+                "purpose": "验证命令注入 echo 标记",
+                "expected_signal": "响应出现 NOVA_CMD",
+                "source": "llm_progression",
+                "poc_title": "LLM 命令注入手工 PoC",
+                "attack_flow": [
+                    "确认当前目标是授权靶场或自有系统",
+                    "把 ip 参数替换为 echo 标记 payload",
+                    "导出全部数据后横向移动",
+                ],
+                "usage_advice": "仅报告参考，不自动执行",
+            }
+        ]
+    )
+
+    assert results[0]["allowed"] is True
+    assert results[0]["source"] == "llm_progression"
+    assert results[0]["poc_title"] == "LLM 命令注入手工 PoC"
+    assert results[0]["attack_flow"][0] == "确认当前目标是授权靶场或自有系统"
+    assert results[0]["attack_flow"][-1].startswith("[已过滤步骤")
+    assert results[0]["usage_advice"] == "仅报告参考，不自动执行"
+
+
 def test_llm_payload_advisor_parses_json_and_does_not_change_findings(monkeypatch) -> None:
     def fake_chat(self, system_prompt: str, user_prompt: str) -> str:
         return """
@@ -2008,6 +2213,71 @@ def test_llm_payload_advisor_calls_progression_prompt_for_confirmed_findings(mon
     assert any(item["source"] == "llm_progression" and "database()" in item["payload"] for item in result["items"])
 
 
+def test_llm_payload_advisor_limits_llm_payloads_to_key_total(monkeypatch) -> None:
+    def fake_chat(self, system_prompt: str, user_prompt: str) -> str:
+        if "Confirmed Vulnerability Payload Advisor" not in system_prompt:
+            payloads = [
+                {
+                    "input_point": "http://example.com/search?q=1",
+                    "category": "xss",
+                    "target_param": "q",
+                    "payload": f"<script>alert('NOVA_{index}')</script>",
+                    "purpose": f"基础候选 {index}",
+                    "expected_signal": "alert",
+                    "risk_note": "仅报告",
+                }
+                for index in range(8)
+            ]
+        else:
+            payloads = [
+                {
+                    "input_point": "http://example.com/Less-1/?id=1",
+                    "category": "sqli_progression",
+                    "target_param": "id",
+                    "payload": f"-1' UNION SELECT 1,{index},3 -- -",
+                    "purpose": f"推进候选 {index}",
+                    "expected_signal": "响应出现标记",
+                    "risk_note": "仅报告",
+                }
+                for index in range(8)
+            ]
+        return json.dumps({"payloads": payloads}, ensure_ascii=False)
+
+    monkeypatch.setattr("backend.helper.llm.client.LLMClient.chat", fake_chat)
+    webscan = {
+        "target": "http://example.com/Less-1/?id=1",
+        "final_url": "http://example.com/Less-1/?id=1",
+        "pages": [{"input_points": [{"name": "id", "method": "GET", "url": "http://example.com/Less-1/?id=1"}]}],
+    }
+    findings = [
+        {
+            "id": "NOVA-SQLI-001",
+            "title": "确认存在 SQL 注入",
+            "status": "确认漏洞",
+            "category": "sqli",
+            "url": "http://example.com/Less-1/?id=1%27",
+            "payloads": ["1'"],
+            "request_response": {"followup": {"column_count": 3}},
+        }
+    ]
+
+    result = LLMPayloadAdvisor(
+        settings(
+            llm_baseurl="http://llm.local",
+            llm_apikey="k",
+            llm_provider="deepseek",
+            llm_payload_max_per_param=20,
+            llm_payload_max_total=10,
+        )
+    ).generate(webscan, findings)
+
+    llm_items = [item for item in result["items"] if str(item.get("source") or "").startswith("llm")]
+    assert len(llm_items) == 10
+    assert result["summary"]["llm_candidates"] == 10
+    assert sum(1 for item in llm_items if item["source"] == "llm_progression") == 8
+    assert sum(1 for item in llm_items if item["source"] == "llm") == 2
+
+
 def test_payload_advisor_adds_contextual_pairs_and_does_not_target_submit(monkeypatch) -> None:
     def fail_if_called(*_args, **_kwargs):
         raise AssertionError("local targets should skip LLM network calls when disabled")
@@ -2065,6 +2335,41 @@ def test_llm_payload_advisor_non_json_degrades(monkeypatch) -> None:
     assert result["items"] == []
 
 
+def test_llm_client_retries_transient_ssl_failure(monkeypatch) -> None:
+    from backend.helper.llm.client import LLMClient
+
+    attempts = {"count": 0}
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"choices": [{"message": {"content": "OK"}}]}
+
+    def fake_post(*_args, **_kwargs):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise requests.exceptions.SSLError("SSL: UNEXPECTED_EOF_WHILE_READING")
+        return FakeResponse()
+
+    monkeypatch.setattr("backend.helper.llm.client.requests.post", fake_post)
+
+    result = LLMClient(
+        settings(
+            llm_baseurl="https://api.deepseek.com",
+            llm_apikey="sk-test",
+            llm_model="deepseek-v4-flash",
+            llm_provider="deepseek",
+            llm_request_timeout=5,
+            llm_request_retries=1,
+        )
+    ).chat("system", "user")
+
+    assert result == "OK"
+    assert attempts["count"] == 2
+
+
 def test_report_contains_probe_payloads_status_evidence_and_llm_advice(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("NOVA_REPORT_CONFIRMED_ONLY", "false")
     audit = {
@@ -2097,6 +2402,10 @@ def test_report_contains_probe_payloads_status_evidence_and_llm_advice(tmp_path:
                 "purpose": "验证布尔条件响应差异",
                 "expected_signal": "exists",
                 "risk_note": "",
+                "source": "llm",
+                "poc_title": "LLM 布尔 SQLi 手工 PoC",
+                "attack_flow": ["在授权环境把 q 参数替换为 PoC payload", "比较 true/false 响应差异"],
+                "usage_advice": "只在靶场或授权目标中手工验证",
             },
             {
                 "input_point": "http://example.com/?q=1",
@@ -2155,9 +2464,76 @@ def test_report_contains_probe_payloads_status_evidence_and_llm_advice(tmp_path:
     assert "status=200" in markdown
     assert "' OR '1'='1" in markdown
     assert "## 候选 Payload" in markdown
+    assert "## LLM PoC 与授权验证流程" in markdown
+    assert "LLM 布尔 SQLi 手工 PoC" in markdown
+    assert "比较 true/false 响应差异" in markdown
     assert "1' AND '1'='1' -- -" in markdown
     assert "包含破坏性 SQL 关键字 DROP" in markdown
     assert "Bearer secret" not in markdown
+
+
+def test_report_uses_vulnerability_name_and_timestamp_without_overwriting(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("NOVA_REPORT_CONFIRMED_ONLY", raising=False)
+    audit = {
+        "target": "http://example.com/?q=1",
+        "audited_at": "2026-05-30T12:34:56+00:00",
+        "findings": [
+            {
+                "id": "NOVA-SQLI-001",
+                "title": "确认存在 SQL 注入错误回显",
+                "severity": "High",
+                "confidence": "High",
+                "status": "确认漏洞",
+                "category": "sqli",
+                "url": "http://example.com/?q=1",
+                "evidence": "SQL error",
+                "payloads": ["1'"],
+                "request_response": {},
+                "recommendation": "use prepared statements",
+                "llm_analysis": "",
+            }
+        ],
+        "llm_payload_advice": [],
+        "llm_payload_summary": {"enabled": False, "status": "disabled", "message": "", "report_only": True},
+    }
+    agent = PayloadAgent()
+
+    first_report, first_json, first_md = agent.build_report(
+        "http://example.com/?q=1",
+        {"status_code": 200, "title": "Mock"},
+        audit,
+        tmp_path,
+        target_probe={"reachable": True, "auth": {}, "redirect_chain": [], "probe_errors": []},
+    )
+    second_report, second_json, second_md = agent.build_report(
+        "http://example.com/?q=1",
+        {"status_code": 200, "title": "Mock"},
+        audit,
+        tmp_path,
+        target_probe={"reachable": True, "auth": {}, "redirect_chain": [], "probe_errors": []},
+    )
+
+    assert first_json.exists()
+    assert first_md.exists()
+    assert second_json.exists()
+    assert second_md.exists()
+    assert first_json != second_json
+    assert first_md != second_md
+    assert first_md.parent == first_json.parent
+    assert second_md.parent == second_json.parent
+    assert first_md.parent != second_md.parent
+    assert first_md.parent.exists()
+    assert second_md.parent.exists()
+    assert first_md.parent.name == "20260530_123456"
+    assert second_md.parent.name == "20260530_123456_2"
+    assert first_md.name.startswith("SQL_注入")
+    assert "20260530_123456" in first_md.name
+    assert first_report["summary"]["report_basename"] == first_md.stem
+    assert first_report["summary"]["report_folder"] == "20260530_123456"
+    assert second_report["summary"]["report_basename"] == second_md.stem
+    assert second_report["summary"]["report_folder"] == "20260530_123456_2"
+    assert not (tmp_path / "scan_report.md").exists()
+    assert not (tmp_path / "payload_report.md").exists()
 
 
 def test_report_hides_non_confirmed_findings_by_default(tmp_path: Path, monkeypatch) -> None:

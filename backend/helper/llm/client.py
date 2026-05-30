@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from urllib.request import Request, urlopen
 import json
+import time
+
+import requests
 
 from backend.helper.settings import RuntimeSettings
 
@@ -27,16 +29,22 @@ class LLMClient:
             ],
             "temperature": 0.2,
         }
-        request = Request(
-            endpoint,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self.settings.llm_apikey}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-
-        with urlopen(request, timeout=self.settings.request_timeout) as response:
-            data = json.loads(response.read().decode("utf-8"))
-        return data["choices"][0]["message"]["content"]
+        headers = {
+            "Authorization": f"Bearer {self.settings.llm_apikey}",
+            "Content-Type": "application/json",
+        }
+        timeout = getattr(self.settings, "llm_request_timeout", None) or self.settings.request_timeout
+        retries = max(0, int(getattr(self.settings, "llm_request_retries", 2)))
+        last_error: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                response = requests.post(endpoint, headers=headers, data=json.dumps(payload), timeout=timeout)
+                response.raise_for_status()
+                data = response.json()
+                return data["choices"][0]["message"]["content"]
+            except Exception as exc:
+                last_error = exc
+                if attempt >= retries:
+                    break
+                time.sleep(min(0.5 * (attempt + 1), 2.0))
+        raise RuntimeError(f"LLM request failed after {retries + 1} attempts: {last_error}") from last_error

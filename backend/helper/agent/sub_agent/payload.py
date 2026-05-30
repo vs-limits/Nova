@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 import os
 from pathlib import Path
+import re
 from typing import Any
 
 from backend.helper.utils import ensure_dir, write_json
@@ -84,16 +86,66 @@ class PayloadAgent:
             },
         }
 
-        json_path = report_dir / "scan_report.json"
-        markdown_path = report_dir / "scan_report.md"
+        json_path, markdown_path = self._report_paths(report_dir, report)
+        report["artifacts"]["json_report"] = str(json_path)
+        report["artifacts"]["markdown_report"] = str(markdown_path)
+        report["artifacts"]["report_folder"] = str(markdown_path.parent)
+        report["summary"]["report_basename"] = markdown_path.stem
+        report["summary"]["report_folder"] = markdown_path.parent.name
         write_json(json_path, report)
         markdown_path.write_text(self._markdown(report), encoding="utf-8-sig")
 
-        legacy_json_path = report_dir / "payload_report.json"
-        legacy_markdown_path = report_dir / "payload_report.md"
-        write_json(legacy_json_path, report)
-        legacy_markdown_path.write_text(self._markdown(report), encoding="utf-8-sig")
         return report, json_path, markdown_path
+
+    def _report_paths(self, report_dir: Path, report: dict) -> tuple[Path, Path]:
+        stamp = self._timestamp_for_filename(str((report.get("summary") or {}).get("generated_at") or ""))
+        base_name = self._report_base_name(report, stamp)
+        folder = self._report_folder(report_dir, stamp)
+        ensure_dir(folder)
+        return folder / f"{base_name}.json", folder / f"{base_name}.md"
+
+    def _report_folder(self, report_dir: Path, stamp: str) -> Path:
+        folder = report_dir / stamp
+        if not folder.exists():
+            return folder
+        index = 2
+        while True:
+            candidate = report_dir / f"{stamp}_{index}"
+            if not candidate.exists():
+                return candidate
+            index += 1
+
+    def _report_base_name(self, report: dict, stamp: str) -> str:
+        vuln_name = self._primary_vulnerability_name(report)
+        return f"{self._safe_filename_part(vuln_name)}_{stamp}"
+
+    def _primary_vulnerability_name(self, report: dict) -> str:
+        findings = report.get("findings", [])
+        if findings:
+            category = str(findings[0].get("category") or "")
+            label = str(findings[0].get("category_label") or category_label(category))
+            if len({str(item.get("category") or "") for item in findings}) > 1:
+                return f"{label}等{len(findings)}项"
+            return label
+        return "无明显漏洞"
+
+    def _timestamp_for_filename(self, value: str) -> str:
+        if value:
+            try:
+                normalized = value.replace("Z", "+00:00")
+                parsed = datetime.fromisoformat(normalized)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.strftime("%Y%m%d_%H%M%S")
+            except ValueError:
+                pass
+        return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+    def _safe_filename_part(self, value: str) -> str:
+        cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value)
+        cleaned = re.sub(r"\s+", "_", cleaned).strip("._ ")
+        cleaned = re.sub(r"_+", "_", cleaned)
+        return (cleaned or "NOVA扫描报告")[:80]
 
     def _severity_score(self, severity: str) -> int:
         return {"Critical": 4, "High": 3, "Medium": 2, "Low": 1, "Info": 0}.get(severity, 0)
@@ -317,6 +369,7 @@ class PayloadAgent:
                         ]
                     )
 
+        lines.extend(self._llm_poc_flow_section(report))
         lines.extend(self._candidate_payload_section(report))
         return "\n".join(lines) + "\n"
 
@@ -324,6 +377,8 @@ class PayloadAgent:
         details = finding.get("details") or {}
         if finding.get("category") == "csrf" and details.get("evidence_type") == "get_state_change_form":
             return "证据/触发方式（未自动执行）"
+        if (finding.get("poc") or {}).get("execution") == "manual":
+            return "手工 PoC（未自动执行）"
         return "已执行 payload"
 
     def _format_poc(self, poc: dict[str, Any]) -> str:
@@ -357,6 +412,54 @@ class PayloadAgent:
                 f"{category_label(item.get('category'))}/{item.get('source', 'llm')}: `{payload}`；用途：{item.get('purpose') or 'N/A'}"
             )
         return " | ".join(snippets)
+
+    def _llm_poc_flow_section(self, report: dict) -> list[str]:
+        advice = report.get("llm_payload_advice", [])
+        summary = report.get("llm_payload_summary", {})
+        llm_items = [
+            item
+            for item in advice
+            if item.get("allowed") and str(item.get("source") or "").startswith("llm")
+        ]
+        lines = [
+            "## LLM PoC 与授权验证流程",
+            "",
+            "说明：本节只展示来源为 `llm` 或 `llm_progression` 的 AI 候选内容。它们仅供授权环境手工复核，不会被 NOVA 自动执行，也不能替代本地响应证据。",
+            "",
+        ]
+        if not llm_items:
+            message = summary.get("message") or "本次没有 LLM 生成的 PoC。"
+            lines.extend([f"本次没有可展示的 LLM PoC：{message}", ""])
+            return lines
+
+        for index, item in enumerate(llm_items, start=1):
+            payload = item.get("payload") or item.get("true_payload") or ""
+            flow = item.get("attack_flow") or []
+            lines.extend(
+                [
+                    f"### LLM PoC {index}: {item.get('poc_title') or category_label(item.get('category'))}",
+                    "",
+                    f"- 漏洞类型：{category_label(item.get('category'))}（{item.get('category', 'unknown')}）",
+                    f"- 来源：{item.get('source', 'llm')}",
+                    f"- 输入点：{item.get('input_point') or 'N/A'}",
+                    f"- 参数：{item.get('target_param') or 'N/A'}",
+                    f"- PoC payload：`{payload}`",
+                    f"- 用途：{item.get('purpose') or 'N/A'}",
+                    f"- 预期现象：{item.get('expected_signal') or 'N/A'}",
+                ]
+            )
+            if flow:
+                lines.append("- 授权验证流程：")
+                for step_number, step in enumerate(flow, start=1):
+                    lines.append(f"  {step_number}. {step}")
+            else:
+                lines.append("- 授权验证流程：LLM 未提供结构化步骤。")
+            if item.get("usage_advice"):
+                lines.append(f"- 使用建议：{item.get('usage_advice')}")
+            if item.get("risk_note"):
+                lines.append(f"- 风险提示：{item.get('risk_note')}")
+            lines.append("")
+        return lines
 
     def _format_details(self, details: dict[str, Any]) -> str:
         if not details:
@@ -479,9 +582,13 @@ class PayloadAgent:
                         [
                             f"- 用途：{first.get('purpose') or 'N/A'}",
                             f"- 过滤结果：{first.get('filter_reason')}",
-                            "",
                         ]
                     )
+                    if first.get("attack_flow"):
+                        lines.append(f"- 授权验证流程：{' -> '.join(first.get('attack_flow', []))}")
+                    if first.get("usage_advice"):
+                        lines.append(f"- 使用建议：{first.get('usage_advice')}")
+                    lines.append("")
 
                 for item in singles:
                     lines.extend(
@@ -493,9 +600,13 @@ class PayloadAgent:
                             f"- 用途：{item.get('purpose') or 'N/A'}",
                             f"- 预期信号：{item.get('expected_signal') or 'N/A'}",
                             f"- 过滤结果：{item.get('filter_reason')}",
-                            "",
                         ]
                     )
+                    if item.get("attack_flow"):
+                        lines.append(f"- 授权验证流程：{' -> '.join(item.get('attack_flow', []))}")
+                    if item.get("usage_advice"):
+                        lines.append(f"- 使用建议：{item.get('usage_advice')}")
+                    lines.append("")
         else:
             lines.extend(["没有通过 Safety Filter 的候选 payload。", ""])
 

@@ -182,6 +182,8 @@ class WebScannerAgent:
                 continue
 
             if self.settings.focus_target_path and not self._active_path_allowed(target_url, page.get("final_url") or url):
+                page["active_testable"] = False
+                page["active_scope_reason"] = "outside_target_path"
                 self._deactivate_page_inputs(page, "outside_target_path")
                 self._deactivate_page_forms(page, "outside_target_path")
                 events.append(
@@ -281,6 +283,7 @@ class WebScannerAgent:
             "reachable": True,
             "status_code": status_code,
             "final_url": final_url,
+            "active_testable": True,
             "headers": headers,
             "title": parser.title[:120],
             "links": self._dedupe(parser.links)[: self.settings.max_links],
