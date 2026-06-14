@@ -169,8 +169,9 @@ false: 1' AND '1'='2' #
 | `NOVA_LLM_PAYLOAD_MAX_PER_PARAM` | `5` | 每个参数最多保留的候选数量 |
 | `NOVA_LLM_PAYLOAD_MAX_TOTAL` | `10` | LLM/LLM progression 候选 payload 总量上限；优先保留关键推进候选 |
 | `NOVA_LLM_PAYLOAD_REPORT_ONLY` | `true` | 候选 payload 是否仅报告。第一版按仅报告处理 |
-| `NOVA_LLM_REQUEST_TIMEOUT` | `30` | LLM 单次调用超时时间，单位秒；上下文较大或模型较慢时可调到 `60` |
+| `NOVA_LLM_REQUEST_TIMEOUT` | `60` | LLM 单次调用超时时间，单位秒；上下文较大或模型较慢时可调到 `90` 或 `120` |
 | `NOVA_LLM_REQUEST_RETRIES` | `2` | LLM 调用遇到临时 TLS/网络断开时的重试次数 |
+| `NOVA_LLM_PROXY` | 空 | LLM 专用代理地址，例如 `http://127.0.0.1:7890`；当 `api.deepseek.com` 直连超时或被重置时使用 |
 | `NOVA_REPORT_CONFIRMED_ONLY` | `true` | 报告是否过滤普通非确认项 |
 | `NOVA_REPORT_VERIFIABLE_CANDIDATES` | `true` | 在过滤模式下是否仍展示 SSRF、存储型 XSS、文件上传等可验证候选 |
 

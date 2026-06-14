@@ -13,13 +13,13 @@ class HttpClient:
         self.opener = opener
 
     def get(self, url: str) -> dict | None:
+        request = Request(
+            url,
+            headers={"User-Agent": "NOVA-safe-scanner/1.0", **self.settings.auth_headers},
+            method="GET",
+        )
+        timeout = max(0.5, min(float(self.settings.request_timeout), float(self.settings.active_request_timeout)))
         try:
-            request = Request(
-                url,
-                headers={"User-Agent": "NOVA-safe-scanner/1.0", **self.settings.auth_headers},
-                method="GET",
-            )
-            timeout = max(0.5, min(float(self.settings.request_timeout), float(self.settings.active_request_timeout)))
             with self.opener(request, timeout=timeout) as response:
                 body = response.read(300000).decode(
                     response.headers.get_content_charset() or "utf-8",
@@ -33,6 +33,19 @@ class HttpClient:
                     "body": body,
                     "body_length": len(body),
                 }
+        except HTTPError as exc:
+            body = exc.read(300000).decode(
+                exc.headers.get_content_charset() or "utf-8",
+                errors="replace",
+            )
+            return {
+                "url": exc.url,
+                "status_code": exc.code,
+                "headers": self._headers_dict(exc.headers),
+                "set_cookie": self._set_cookie_values(exc.headers),
+                "body": body,
+                "body_length": len(body),
+            }
         except Exception:
             return None
 
@@ -159,6 +172,19 @@ class HttpClient:
                     "body": body,
                     "body_length": len(body),
                 }
+        except HTTPError as exc:
+            body = exc.read(300000).decode(
+                exc.headers.get_content_charset() or "utf-8",
+                errors="replace",
+            )
+            return {
+                "url": exc.url,
+                "status_code": exc.code,
+                "headers": self._headers_dict(exc.headers),
+                "set_cookie": self._set_cookie_values(exc.headers),
+                "body": body,
+                "body_length": len(body),
+            }
         except Exception:
             return None
 

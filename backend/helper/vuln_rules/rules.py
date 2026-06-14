@@ -1044,6 +1044,12 @@ class FileUploadRule:
             return []
         nonce = f"NOVA_UPLOAD_{context.new_id('NONCE').split('-')[-1]}"
         file_field = (form.get("file_inputs") or [{}])[0].get("name", "file")
+        action_url = form.get("action", context.target)
+        hidden_fields = [
+            field.get("name")
+            for field in form.get("inputs", [])
+            if field.get("name") and str(field.get("type") or "").lower() == "hidden"
+        ]
         if not context.settings.file_upload_probes:
             return [
                 context.finding(
@@ -1052,8 +1058,8 @@ class FileUploadRule:
                     "Medium",
                     "Medium",
                     "file_upload",
-                    form.get("action", context.target),
-                    "发现文件上传表单；默认未上传测试文件。",
+                    action_url,
+                    "发现文件上传表单；默认未上传测试文件。可在授权靶场中开启 NOVA_FILE_UPLOAD_PROBES=true 做 harmless .txt 验证。",
                     payloads=[f"nova-upload-check.txt:{nonce}"],
                     status=STATUS_SUSPECTED,
                     details={
@@ -1062,13 +1068,20 @@ class FileUploadRule:
                         "opt_in_required": "NOVA_FILE_UPLOAD_PROBES=true",
                         "target_param": file_field,
                         "nonce": nonce,
-                        "confirmation_basis": "默认候选：需要显式开启后上传 harmless 文本文件并确认回显/可访问",
+                        "enctype": form.get("enctype", ""),
+                        "hidden_fields": hidden_fields,
+                        "has_user_token": any("token" in str(name).lower() for name in hidden_fields),
+                        "candidate_payloads": [
+                            f"filename=nova-upload-check.txt; content={nonce}; content_type=text/plain",
+                            "filename=nova-upload-check.png; content=benign image marker; content_type=image/png",
+                        ],
+                        "confirmation_basis": "默认候选：需要显式开启后上传 harmless 文本文件并确认回显或同源可访问",
                     },
                 )
             ]
         fields = {field.get("name"): str(field.get("value") or "") for field in form.get("inputs", []) if field.get("name") and field.get("type") != "file"}
         response = context.http_client.post_multipart_text_file(
-            form.get("action", context.target),
+            action_url,
             fields,
             file_field,
             "nova-upload-check.txt",
@@ -1097,7 +1110,58 @@ class FileUploadRule:
                     },
                 )
             ]
+        if response:
+            verify_response = self._verify_uploaded_text_file(context, action_url, response, nonce)
+            if verify_response:
+                return [
+                    context.finding(
+                        context.new_id("UPLOAD"),
+                        "确认存在可访问文件上传风险",
+                        "High",
+                        "High",
+                        "file_upload",
+                        verify_response["url"],
+                        f"启用 NOVA_FILE_UPLOAD_PROBES 后，上传 harmless 文本文件并在同源返回路径中读取到唯一内容 {nonce}。",
+                        payloads=[f"nova-upload-check.txt:{nonce}", verify_response["url"]],
+                        status=STATUS_CONFIRMED,
+                        request_response={
+                            "post": response_evidence(response),
+                            "verify": response_evidence(verify_response, matched=nonce),
+                        },
+                        details={
+                            "rule_id": self.rule_id,
+                            "evidence_type": "upload_same_origin_readback",
+                            "enabled_by": "NOVA_FILE_UPLOAD_PROBES",
+                            "target_param": file_field,
+                            "nonce": nonce,
+                            "confirmation_basis": "上传 harmless 文本文件后，响应返回的同源路径可读取唯一 nonce",
+                        },
+                    )
+                ]
         return []
+
+    def _verify_uploaded_text_file(self, context: RuleContext, action_url: str, response: dict, nonce: str) -> dict | None:
+        body = str(response.get("body") or "")
+        for candidate in self._uploaded_text_urls(action_url, body):
+            verify = context.http_client.get(candidate)
+            if verify and nonce in str(verify.get("body") or ""):
+                return verify
+        return None
+
+    def _uploaded_text_urls(self, action_url: str, body: str) -> list[str]:
+        urls: list[str] = []
+        patterns = (
+            r"""(?:href|src)=["']([^"']*nova-upload-check\.txt[^"']*)["']""",
+            r"""((?:\.\./|/|uploads?/|hackable/uploads/)[^\s"'<>]*nova-upload-check\.txt)""",
+        )
+        base_host = urlparse(action_url).netloc.lower()
+        for pattern in patterns:
+            for match in re.findall(pattern, body, re.I):
+                candidate = urljoin(action_url, match)
+                parsed = urlparse(candidate)
+                if parsed.scheme in {"http", "https"} and parsed.netloc.lower() == base_host and candidate not in urls:
+                    urls.append(candidate)
+        return urls[:3]
 
 
 class DomXssRule:
@@ -1233,10 +1297,8 @@ class SqliRule:
             context.probe_failed = True
             return []
         quote_probe = self._safe_get(context, url, param, "1'", context_params)
-        if not quote_probe:
-            context.probe_failed = True
-            return []
-        if has_sql_error(quote_probe.get("body", "")):
+        quote_probe_failed = quote_probe is None
+        if quote_probe and has_sql_error(quote_probe.get("body", "")):
             followup = self._sqli_error_followup(context, url, param, context_params)
             payloads = ["1'", *followup.get("payloads", [])]
             details = self._sqli_details(quote_probe.get("body", ""), followup)
@@ -1270,12 +1332,41 @@ class SqliRule:
             (f"1' AND '1'='1' {SQL_COMMENT_SUFFIX}", f"1' AND '1'='2' {SQL_COMMENT_SUFFIX}"),
             (f"1' AND 1=1 {SQL_COMMENT_SUFFIX}", f"1' AND 1=2 {SQL_COMMENT_SUFFIX}"),
         ]
+        pair_failed = False
         for true_payload, false_payload in payload_pairs:
             true_probe = self._safe_get(context, url, param, true_payload, context_params)
             false_probe = self._safe_get(context, url, param, false_payload, context_params)
             if not true_probe or not false_probe:
-                context.probe_failed = True
-                return []
+                pair_failed = True
+                continue
+            marker_reason = self._blind_signal_reason(true_probe.get("body", ""), false_probe.get("body", ""))
+            if marker_reason:
+                return [
+                    context.finding(
+                        context.new_id("SQLI"),
+                        "确认存在布尔型 SQL 盲注",
+                        "High",
+                        "High",
+                        "sqli_blind",
+                        false_probe["url"],
+                        marker_reason,
+                        payloads=[true_payload, false_payload],
+                        status=STATUS_CONFIRMED,
+                        request_response={
+                            "baseline": response_evidence(baseline),
+                            "true_case": response_evidence(true_probe, matched="boolean marker"),
+                            "false_case": response_evidence(false_probe, matched="boolean marker"),
+                        },
+                        details={
+                            "rule_id": self.rule_id,
+                            "evidence_type": "boolean_response_marker",
+                            "target_param": param,
+                            "verification_method": "dvwa_blind_marker_pair",
+                            "confirmation_basis": marker_reason,
+                            "techniques": ["布尔型 SQL 盲注"],
+                        },
+                    )
+                ]
             true_score = similarity_score(baseline["body"], true_probe["body"])
             false_score = similarity_score(baseline["body"], false_probe["body"])
             if true_score >= 0.90 and false_score <= 0.75 and abs(true_score - false_score) >= 0.20:
@@ -1307,7 +1398,25 @@ class SqliRule:
                         },
                     )
                 ]
+        if pair_failed or quote_probe_failed:
+            context.probe_failed = True
         return []
+
+    def _blind_signal_reason(self, true_body: str, false_body: str) -> str:
+        true_lower = true_body.lower()
+        false_lower = false_body.lower()
+        markers = [
+            ("User ID exists in the database.", "User ID is MISSING from the database."),
+            ("User ID exists", "User ID is MISSING"),
+            ("exists in the database", "MISSING from the database"),
+        ]
+        for true_marker, false_marker in markers:
+            true_seen = true_marker.lower() in true_lower and false_marker.lower() in false_lower
+            false_seen = true_marker.lower() in false_lower and false_marker.lower() in true_lower
+            if true_seen or false_seen:
+                orientation = "true" if true_seen else "false"
+                return f"布尔条件响应出现稳定差异：{orientation} 响应包含 {true_marker}，另一响应包含 {false_marker}。"
+        return ""
 
     def _safe_get(self, context: RuleContext, url: str, param: str, payload: str, context_params: dict) -> dict | None:
         allowed, _reason = safe_active_payload(payload)

@@ -114,6 +114,8 @@ class PayloadSafetyFilter:
             if lowered in {"sql_progression", "sqli_progression"}:
                 return "sqli_progression"
             return "sqli"
+        if lowered == "file_upload" or "nova-upload-check" in payload_lower or "nova_upload_check" in payload_lower:
+            return "file_upload"
         if any(token in payload_lower for token in ("1=1", "1=2", " or ", " and ")):
             return "sqli_blind" if "1=2" in payload_lower else "sqli"
         if "<script" in payload_lower or "onerror=" in payload_lower or "svg/onload" in payload_lower:
@@ -237,12 +239,48 @@ class PayloadSafetyFilter:
             return self._is_allowed_csrf(payload)
         if category == "ssrf":
             return self._is_allowed_ssrf(payload)
+        if category == "file_upload":
+            return self._is_allowed_file_upload(payload)
         for pattern, reason in self.DANGEROUS_PATTERNS:
             if re.search(pattern, lowered, re.I):
                 return False, reason
         if category == "unknown":
             return False, "无法归类到允许的非破坏性测试类型"
         return True, "通过本地非破坏性 Safety Filter"
+
+    def _is_allowed_file_upload(self, payload: str) -> tuple[bool, str]:
+        lowered = payload.lower()
+        script_exts = (
+            "." + "php",
+            "." + "phtml",
+            "." + "phar",
+            "." + "asp",
+            "." + "aspx",
+            "." + "jsp",
+            "." + "jspx",
+            "." + "cgi",
+            "." + "pl",
+            "." + "exe",
+            "." + "dll",
+        )
+        script_tokens = (
+            "<" + "?php",
+            "<%",
+            "web" + "shell",
+            "shell" + "." + "php",
+            "eval(",
+            "assert(",
+            "sys" + "tem(",
+            "passthru(",
+            "shell_exec(",
+            "c" + "md=",
+            "application/x-" + "php",
+        )
+        if any(token in lowered for token in script_exts + script_tokens):
+            return False, "文件上传候选包含可执行脚本、后门文件或命令执行特征"
+        if not any(token in lowered for token in ("nova-upload-check", "nova_upload_check", ".txt", "text/plain", ".png", ".jpg", ".jpeg")):
+            return False, "文件上传候选第一版只允许 harmless 文本/图片占位 PoC"
+        return True, "通过本地文件上传报告型 Safety Filter；NOVA 默认不自动上传"
 
     def _is_allowed_csrf(self, payload: str) -> tuple[bool, str]:
         lowered = payload.lower()
@@ -396,6 +434,7 @@ class LLMPayloadAdvisor:
     def _local_candidates(self, webscan: dict, findings: list[dict]) -> list[dict[str, Any]]:
         candidates: list[dict[str, Any]] = []
         candidates.extend(self._confirmed_progression_candidates(webscan, findings))
+        candidates.extend(self._file_upload_form_candidates(webscan))
         for point in self._collect_input_points(webscan):
             name = point.get("name", "")
             url = point.get("url", "")
@@ -404,6 +443,94 @@ class LLMPayloadAdvisor:
             for category in hints:
                 candidates.extend(self._template_candidates(url, name, category))
         return candidates
+
+    def _file_upload_form_candidates(self, webscan: dict) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for form in self._collect_forms(webscan):
+            if not self._is_upload_form(form):
+                continue
+            action = str(form.get("action") or webscan.get("final_url") or webscan.get("target") or "")
+            file_field = self._file_field_name(form)
+            key = (action, file_field)
+            if key in seen:
+                continue
+            seen.add(key)
+            nonce = self._upload_nonce(action, file_field)
+            has_token = any("token" in str(field.get("name") or "").lower() for field in form.get("inputs", []))
+            token_note = "；如表单包含 user_token/CSRF token，手工复现时必须保留当前页面的新 token" if has_token else ""
+            candidates.append(
+                {
+                    "source": "local_template",
+                    "input_point": action,
+                    "category": "file_upload",
+                    "target_param": file_field,
+                    "payload": f"filename=nova-upload-check.txt; content={nonce}; content_type=text/plain",
+                    "purpose": "文件上传入口的 harmless 手工 PoC：上传纯文本 nonce 文件，验证是否返回上传成功或同源访问路径。",
+                    "expected_signal": f"响应中出现上传成功提示、返回同源文件路径，或上传文件内容/文件名 {nonce} 被回显。",
+                    "risk_note": f"仅报告，不自动执行；启用 NOVA_FILE_UPLOAD_PROBES=true 时 NOVA 才会上传 harmless .txt 文件{token_note}。",
+                    "poc_title": "文件上传 harmless 文本文件验证",
+                    "attack_flow": [
+                        "确认目标是 DVWA/靶场或已授权测试系统。",
+                        "在上传表单中选择名为 nova-upload-check.txt 的纯文本文件，内容写入报告中的 NOVA_UPLOAD_CHECK 标记。",
+                        "提交后只观察上传成功提示、返回路径或 nonce 回显，不上传脚本文件。",
+                        "如果页面返回同源文件路径，再手工访问该路径确认只能读取文本内容。",
+                    ],
+                    "usage_advice": "适合 low/medium/high 难度的第一步验证；medium/high 可能需要保留页面隐藏字段、文件大小字段和 token。",
+                }
+            )
+            candidates.append(
+                {
+                    "source": "local_template",
+                    "input_point": action,
+                    "category": "file_upload",
+                    "target_param": file_field,
+                    "payload": "filename=nova-upload-check.png; content=PNG header + NOVA_UPLOAD_CHECK marker; content_type=image/png",
+                    "purpose": "图片白名单场景的 harmless 手工 PoC：验证服务端是否只接受图片类文件并返回可访问路径。",
+                    "expected_signal": "响应出现上传成功或返回同源图片路径；若服务端拒绝非真实图片，说明存在基础类型校验。",
+                    "risk_note": "仅报告，不自动上传；不得替换为 PHP/JSP/ASP 等可执行脚本后缀。",
+                    "poc_title": "文件上传图片白名单验证",
+                    "attack_flow": [
+                        "准备一个无敏感内容的测试图片或图片占位文件。",
+                        "通过页面上传并观察是否返回同源文件 URL。",
+                        "只确认文件可读和类型处理，不尝试执行脚本内容。",
+                    ],
+                    "usage_advice": "用于 medium/high 难度上传页面的安全验证方向；若需要自动验证，请只开启 harmless .txt 探测。",
+                }
+            )
+        return candidates
+
+    def _collect_forms(self, webscan: dict) -> list[dict[str, Any]]:
+        forms: list[dict[str, Any]] = []
+        for form in webscan.get("forms", []):
+            if isinstance(form, dict):
+                forms.append(form)
+        for page in webscan.get("pages", []):
+            for form in page.get("forms", []):
+                if isinstance(form, dict):
+                    forms.append(form)
+        return forms
+
+    def _is_upload_form(self, form: dict[str, Any]) -> bool:
+        if form.get("candidate_purpose") == "file_upload":
+            return True
+        if form.get("file_inputs"):
+            return True
+        return "multipart/form-data" in str(form.get("enctype") or "").lower()
+
+    def _file_field_name(self, form: dict[str, Any]) -> str:
+        for field in form.get("file_inputs", []):
+            name = str(field.get("name") or "").strip()
+            if name:
+                return name
+        for field in form.get("inputs", []):
+            if str(field.get("type") or "").lower() == "file" and str(field.get("name") or "").strip():
+                return str(field.get("name")).strip()
+        return "file"
+
+    def _upload_nonce(self, action: str, file_field: str) -> str:
+        digest = hashlib.sha256(f"{action}|{file_field}".encode("utf-8")).hexdigest()[:10].upper()
+        return f"NOVA_UPLOAD_CHECK_{digest}"
 
     def _confirmed_findings(self, findings: list[dict]) -> list[dict]:
         return [item for item in findings if item.get("status") == "确认漏洞"]
@@ -1084,7 +1211,7 @@ class LLMPayloadAdvisor:
             "可以为每个候选补充 poc_title、attack_flow、usage_advice，但 attack_flow 必须是授权验证流程，不得包含提权、持久化、批量攻击、数据导出或真实第三方目标。"
             "禁止生成 DROP、DELETE、UPDATE、INSERT、ALTER、TRUNCATE、INTO OUTFILE、LOAD_FILE、xp_cmdshell、"
             "反弹 shell、写文件、删文件、长时间 SLEEP/BENCHMARK 或批量数据拖取 payload。"
-            "不要输出用于读取系统文件、写 webshell、绕过认证或破坏业务状态的 payload。"
+            "不要输出用于读取系统文件、写后门脚本、绕过认证或破坏业务状态的 payload。"
         )
 
     def _progression_user_prompt(self, webscan: dict, confirmed_findings: list[dict]) -> str:

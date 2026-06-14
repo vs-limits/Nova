@@ -97,6 +97,7 @@ def settings_from_args(args: argparse.Namespace) -> RuntimeSettings:
         llm_payload_report_only=settings.llm_payload_report_only,
         llm_request_timeout=settings.llm_request_timeout,
         llm_request_retries=settings.llm_request_retries,
+        llm_proxy=settings.llm_proxy,
         report_confirmed_only=settings.report_confirmed_only,
         report_verifiable_candidates=settings.report_verifiable_candidates,
         allowed_hosts=settings.allowed_hosts,

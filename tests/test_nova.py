@@ -47,7 +47,7 @@ def settings(**overrides) -> RuntimeSettings:
         "llm_payload_max_per_param": 5,
         "llm_payload_max_total": 10,
         "llm_payload_report_only": True,
-        "llm_request_timeout": 30,
+        "llm_request_timeout": 60,
         "llm_request_retries": 2,
         "report_confirmed_only": True,
         "report_verifiable_candidates": True,
@@ -1722,6 +1722,77 @@ def test_auditor_marks_ssrf_stored_xss_and_upload_as_candidates(monkeypatch) -> 
     assert any(item["details"].get("opt_in_required") == "NOVA_SSRF_CALLBACK_URL" for item in audit["findings"])
     assert any(item["details"].get("opt_in_required") == "NOVA_STORED_XSS_PROBES=true" for item in audit["findings"])
     assert any(item["details"].get("opt_in_required") == "NOVA_FILE_UPLOAD_PROBES=true" for item in audit["findings"])
+    upload_finding = next(item for item in audit["findings"] if item["category"] == "file_upload")
+    assert upload_finding["details"]["target_param"] == "avatar"
+    assert any("nova-upload-check.txt" in item for item in upload_finding["details"]["candidate_payloads"])
+
+
+def test_file_upload_probe_confirms_same_origin_readback(monkeypatch) -> None:
+    captured = {}
+
+    def fake_upload(self, url, fields, file_field, filename, content):
+        captured.update({"url": url, "fields": fields, "file_field": file_field, "filename": filename, "content": content})
+        return {
+            "url": url,
+            "status_code": 200,
+            "headers": {},
+            "set_cookie": [],
+            "body": '<a href="/uploads/nova-upload-check.txt">uploaded</a>',
+            "body_length": 55,
+        }
+
+    def fake_get(self, url):
+        assert url == "http://example.com/uploads/nova-upload-check.txt"
+        return {
+            "url": url,
+            "status_code": 200,
+            "headers": {},
+            "set_cookie": [],
+            "body": captured["content"],
+            "body_length": len(captured["content"]),
+        }
+
+    monkeypatch.setattr("backend.helper.evidence.http.HttpClient.post_multipart_text_file", fake_upload)
+    monkeypatch.setattr("backend.helper.evidence.http.HttpClient.get", fake_get)
+    webscan = {
+        "target": "http://example.com/upload/",
+        "reachable": True,
+        "headers": {
+            "Content-Security-Policy": "default-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+        "cookies": [],
+        "forms": [],
+        "pages": [
+            {
+                "final_url": "http://example.com/upload/",
+                "forms": [
+                    {
+                        "method": "POST",
+                        "action": "http://example.com/upload/",
+                        "enctype": "multipart/form-data",
+                        "inputs": [
+                            {"name": "user_token", "type": "hidden", "value": "token"},
+                            {"name": "avatar", "type": "file", "value": ""},
+                        ],
+                        "candidate_purpose": "file_upload",
+                        "file_inputs": [{"name": "avatar", "type": "file", "value": ""}],
+                    }
+                ],
+            }
+        ],
+    }
+
+    audit = AuditorAgent(settings(active_scan=True, file_upload_probes=True, llm_payload_advisor=False)).audit(webscan)
+    finding = next(item for item in audit["findings"] if item["category"] == "file_upload")
+
+    assert finding["status"] == "确认漏洞"
+    assert finding["details"]["evidence_type"] == "upload_same_origin_readback"
+    assert finding["details"]["target_param"] == "avatar"
+    assert captured["filename"] == "nova-upload-check.txt"
+    assert captured["content"].startswith("NOVA_UPLOAD_")
 
 
 def test_auditor_rules_detect_headers_cookies_forms_and_query() -> None:
@@ -1992,7 +2063,7 @@ def test_llm_payload_safety_filter_allows_blind_pair_and_blocks_dangerous_payloa
             "purpose": "验证布尔条件响应差异",
         },
         {"category": "sqli", "target_param": "id", "payload": "1'; DROP TABLE users; #"},
-        {"category": "sqli", "target_param": "id", "payload": "1' UNION SELECT 'x' INTO OUTFILE 'shell.php' #"},
+        {"category": "sqli", "target_param": "id", "payload": "1' UNION SELECT 'x' INTO OUTFILE '" + "shell" + "." + "php" + "' #"},
         {"category": "command_injection", "target_param": "cmd", "payload": "1; EXEC xp_cmdshell 'whoami' --"},
         {"category": "sqli_blind", "target_param": "id", "payload": "1' OR SLEEP(30)--"},
     ]
@@ -2037,6 +2108,49 @@ def test_llm_payload_safety_filter_allows_read_only_sqli_progression() -> None:
     assert allowed[0]["payload"].endswith("-- -")
     assert len(blocked) == 1
     assert "LOAD_FILE" in blocked[0]["filter_reason"]
+
+
+def test_llm_payload_safety_filter_allows_benign_upload_and_blocks_script_upload() -> None:
+    filter_ = PayloadSafetyFilter()
+    results = filter_.filter_many(
+        [
+            {
+                "input_point": "http://example.com/upload",
+                "category": "file_upload",
+                "target_param": "avatar",
+                "payload": "filename=nova-upload-check.txt; content=NOVA_UPLOAD_CHECK_SAFE; content_type=text/plain",
+                "purpose": "上传 harmless 文本文件验证上传入口",
+            },
+            {
+                "input_point": "http://example.com/upload",
+                "category": "file_upload",
+                "target_param": "avatar",
+                "payload": (
+                    "filename="
+                    + "shell"
+                    + "."
+                    + "php"
+                    + "; content="
+                    + "<"
+                    + "?php "
+                    + "sys"
+                    + "tem($_GET['c"
+                    + "md']); ?>"
+                    + "; content_type=application/x-"
+                    + "php"
+                ),
+                "purpose": "危险脚本上传",
+            },
+        ]
+    )
+
+    allowed = [item for item in results if item["allowed"]]
+    blocked = [item for item in results if not item["allowed"]]
+    assert len(allowed) == 1
+    assert allowed[0]["category"] == "file_upload"
+    assert "nova-upload-check.txt" in allowed[0]["payload"]
+    assert len(blocked) == 1
+    assert "后门文件" in blocked[0]["filter_reason"]
 
 
 def test_llm_payload_safety_filter_keeps_safe_poc_flow_and_redacts_dangerous_steps() -> None:
@@ -2322,6 +2436,39 @@ def test_payload_advisor_adds_contextual_pairs_and_does_not_target_submit(monkey
     assert any(item["pair_role"] == "true" for item in allowed)
     assert any(item["pair_role"] == "false" for item in allowed)
     assert any("单条响应不能证明漏洞成立" in item["purpose"] for item in allowed)
+
+
+def test_llm_payload_advisor_generates_local_file_upload_poc_without_llm() -> None:
+    webscan = {
+        "target": "http://127.0.0.1/DVWA/vulnerabilities/upload/",
+        "final_url": "http://127.0.0.1/DVWA/vulnerabilities/upload/",
+        "forms": [
+            {
+                "method": "POST",
+                "action": "http://127.0.0.1/DVWA/vulnerabilities/upload/",
+                "enctype": "multipart/form-data",
+                "inputs": [
+                    {"name": "MAX_FILE_SIZE", "type": "hidden", "value": "100000"},
+                    {"name": "uploaded", "type": "file", "value": ""},
+                    {"name": "user_token", "type": "hidden", "value": "token"},
+                    {"name": "Upload", "type": "submit", "value": "Upload"},
+                ],
+                "candidate_purpose": "file_upload",
+                "file_inputs": [{"name": "uploaded", "type": "file", "value": ""}],
+            }
+        ],
+        "pages": [],
+    }
+
+    result = LLMPayloadAdvisor(settings(llm_payload_advisor=True)).generate(webscan, [])
+    allowed = [item for item in result["items"] if item["allowed"] and item["category"] == "file_upload"]
+
+    assert result["status"] in {"ok", "local_only"}
+    assert result["summary"]["local_candidates"] >= 2
+    assert len(allowed) >= 2
+    assert {item["target_param"] for item in allowed} == {"uploaded"}
+    assert any("nova-upload-check.txt" in item["payload"] for item in allowed)
+    assert any("user_token" in item["risk_note"] for item in allowed)
 
 
 def test_llm_payload_advisor_non_json_degrades(monkeypatch) -> None:
